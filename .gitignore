@@ -135,3 +135,17 @@ temp/
 # It holds the project and org ids — identifiers rather than secrets, but not
 # something a public repository needs.
 .vercel
+
+# --------------------------------------------------------------------------
+# MCP configuration
+# --------------------------------------------------------------------------
+# mcp.json is where MCP server credentials live. The ${NAME} mechanism means a
+# token *should* stay in the environment, but the format also accepts a literal
+# value, and a public repository is an expensive place to discover that someone
+# pasted one. mcp.json.example is committed instead: same structure, no values.
+#
+# Ignoring a path does not untrack what is already in the index, so mcp.json was
+# additionally removed from tracking with `git rm --cached mcp.json`. The file
+# itself stays on disk and Jarvish keeps reading it; only Git stops following it.
+mcp.json
+!mcp.json.example

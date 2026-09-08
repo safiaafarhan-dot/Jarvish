@@ -1,0 +1,75 @@
+# Nothing in this repository should ever be uploaded to Vercel from the root.
+#
+# The intended deployment has web/ as the Root Directory, in which case Vercel
+# reads web/.vercelignore and never looks at this file. This exists for the
+# case that goes wrong: a `vercel deploy` run from the repository root, where
+# without it the CLI would upload the whole working tree — including 225 MB of
+# live Chrome profile with real cookies and login data, and screenshots of
+# whatever was on screen at the time.
+#
+# .gitignore does not help here. It governs Git, not the Vercel uploader.
+#
+# Deny everything, then allow back only the public web interface. An allowlist
+# fails safe: a new folder of local state added next year is excluded because
+# nobody remembered to exclude it.
+*
+!web/
+!web/**
+
+# Belt and braces — these stay excluded even if the allowlist above is ever
+# loosened, because they are the ones that actually matter.
+
+# Runtime state: databases, event logs, edit backups, personal profile
+data/
+data/browser-profile/
+data/captures/
+data/edits/
+
+# The desktop agent itself. It runs on the user's PC and has no business on a
+# static host: Ollama, MCP subprocesses, voice, vision and desktop control all
+# require the local machine.
+jarvish/
+tests/
+plugins/
+new.py
+requirements.txt
+mcp.json
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.json
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# Models and caches
+models/
+*.gguf
+*.safetensors
+*.onnx
+.cache/
+__pycache__/
+*.pyc
+
+# Backups and scratch
+*.bak
+*.tmp
+*.temp
+
+# Version control and tooling
+.git/
+.github/
+.vercel/
+node_modules/
+.venv/
+venv/

@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Copy this file to mcp.json and edit it. mcp.json is git-ignored, because",
+    "it is where MCP server credentials end up and this repository is public.",
+    "",
+    "Secrets are NAMED here, never written. A value of the form ${NAME} is read",
+    "from the process environment when the server is started, so the token lives",
+    "in your environment and never in a file that git can see. ${NAME:-default}",
+    "supplies a fallback. A variable that is not set is reported by name in",
+    "`python new.py --check` rather than silently becoming empty.",
+    "",
+    "Paths are relative to the project folder. Do not hard-code an absolute path:",
+    "it exposes your username and breaks on every other machine."
+  ],
+
+  "mcpServers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "cwd": ".",
+      "description": "Read and search files inside the Jarvish project folder.",
+      "roots": ["."],
+      "startupTimeout": 120,
+      "enabled": true
+    },
+
+    "everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "description": "The MCP reference server. Exposes tools, resources and prompts.",
+      "riskLevel": "low",
+      "startupTimeout": 120,
+      "enabled": true
+    },
+
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" },
+      "description": "Issues and pull requests. Disabled until you set GITHUB_TOKEN.",
+      "riskLevel": "high",
+      "requiresConfirmation": true,
+      "enabled": false
+    }
+  }
+}
