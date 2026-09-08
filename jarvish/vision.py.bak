@@ -1,0 +1,839 @@
+"""Screen vision: capture, OCR, UI grounding, and the observe→act→verify loop.
+
+Jarvish grounds what it sees in two independent sources, and keeps them
+labelled so nothing downstream has to guess how solid a coordinate is:
+
+* **UI Automation** — Windows' own accessibility tree. Control type, name and
+  rectangle come straight from the application, so these are ground truth.
+  Native apps expose a lot; Chrome and Electron apps expose almost nothing
+  unless accessibility is switched on.
+* **OCR** — Windows' built-in `Windows.Media.Ocr`, which is local, needs no
+  extra binary, and returns a rectangle per word. This works everywhere,
+  including inside browsers, but it only sees *text* — it cannot tell you that
+  a rectangle is a button.
+
+The two are merged into one element list. Where they overlap, UIA wins, because
+it knows what a thing *is* and OCR only knows what it *says*.
+
+A note on confidence: UIA elements are reported at 1.0 because they are the
+application's own description of itself. `Windows.Media.Ocr` does not expose a
+per-word confidence, so OCR elements carry `null` rather than an invented
+number. Nothing here fabricates a score.
+"""
+
+import asyncio
+import base64
+import ctypes
+import re
+import threading
+import time
+from datetime import datetime
+
+from .config import VISION_ENABLED, VISION_MAX_ELEMENTS
+from .util import (DATA_DIR, IS_WINDOWS, as_bool, as_int, boolean, err, ok,
+                   string, tool)
+
+# Every optional dependency is probed once, so a missing one degrades a single
+# capability instead of taking the whole module down.
+try:
+    from PIL import ImageGrab, Image
+    _PIL = True
+except Exception:
+    _PIL = False
+
+try:
+    import comtypes
+    import uiautomation as _auto
+    # The library writes @AutomationLog.txt into the working directory on any
+    # COM hiccup. Keep that out of the user's project folder.
+    try:
+        _auto.Logger.FilePath = str(DATA_DIR / "uiautomation.log")
+    except Exception:
+        pass
+    _UIA = True
+except Exception:
+    _UIA = False
+
+# UI Automation is COM, and COM is per-thread. Tools run on asyncio's worker
+# threads, so each one has to initialise COM before touching the tree or the
+# first call fails with "CoInitialize has not been called". Thread-pool threads
+# are reused, so this happens once per thread and is never torn down.
+_com = threading.local()
+
+
+def _ensure_com():
+    if getattr(_com, "ready", False):
+        return True
+    try:
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+    except OSError:
+        # Already initialised on this thread, in a different apartment. Fine.
+        pass
+    except Exception:
+        return False
+    _com.ready = True
+    return True
+
+try:
+    import winsdk.windows.media.ocr as _ocr_ns          # noqa: F401
+    _WINOCR = True
+except Exception:
+    _WINOCR = False
+
+try:
+    import win32gui
+    import win32process
+    _WIN32 = True
+except Exception:
+    _WIN32 = False
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+
+CAPTURE_DIR = DATA_DIR / "captures"
+# Keep the last few frames on disk so the HUD can show them; drop the rest.
+KEEP_CAPTURES = 12
+
+# Named parts of the screen, as fractions of (left, top, right, bottom).
+REGIONS = {
+    "full": (0.0, 0.0, 1.0, 1.0),
+    "top": (0.0, 0.0, 1.0, 0.35),
+    "bottom": (0.0, 0.65, 1.0, 1.0),
+    "left": (0.0, 0.0, 0.4, 1.0),
+    "right": (0.6, 0.0, 1.0, 1.0),
+    "centre": (0.25, 0.25, 0.75, 0.75),
+    "center": (0.25, 0.25, 0.75, 0.75),
+    "top_left": (0.0, 0.0, 0.5, 0.5),
+    "top_right": (0.5, 0.0, 1.0, 0.5),
+    "bottom_left": (0.0, 0.5, 0.5, 1.0),
+    "bottom_right": (0.5, 0.5, 1.0, 1.0),
+}
+
+# UIA control types worth treating as things a person can act on.
+INTERACTIVE = {
+    "ButtonControl", "HyperlinkControl", "EditControl", "ComboBoxControl",
+    "CheckBoxControl", "RadioButtonControl", "MenuItemControl", "TabItemControl",
+    "ListItemControl", "TreeItemControl", "SliderControl", "SplitButtonControl",
+}
+
+_SIMPLE_TYPE = {
+    "ButtonControl": "button", "HyperlinkControl": "link", "EditControl": "input",
+    "ComboBoxControl": "dropdown", "CheckBoxControl": "checkbox",
+    "RadioButtonControl": "radio", "MenuItemControl": "menu_item",
+    "TabItemControl": "tab", "ListItemControl": "list_item",
+    "TreeItemControl": "tree_item", "TextControl": "text",
+    "ImageControl": "image", "WindowControl": "window", "PaneControl": "pane",
+    "DocumentControl": "document", "SliderControl": "slider",
+    "SplitButtonControl": "button", "GroupControl": "group",
+}
+
+
+def available():
+    """What the visual layer can actually do on this machine right now."""
+    return {
+        "enabled": VISION_ENABLED,
+        "capture": _PIL and IS_WINDOWS,
+        "ocr": _WINOCR,
+        "ui_tree": _UIA,
+        "window_info": _WIN32,
+    }
+
+
+def _missing_capture():
+    if not VISION_ENABLED:
+        return err("Screen vision is disabled. Set JARVISH_VISION=1 to enable it.")
+    if not IS_WINDOWS:
+        return err("Screen vision only works on Windows.")
+    if not _PIL:
+        return err("Screen capture needs Pillow. Install it with "
+                   "`pip install -r requirements.txt`.")
+    return None
+
+
+# --------------------------------------------------------------------------
+# Capture
+# --------------------------------------------------------------------------
+
+def _resolve_region(region):
+    """Turn a named region or an [x, y, w, h] box into an absolute rectangle."""
+    if not region:
+        return None
+    screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+    screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+
+    if isinstance(region, str):
+        key = region.strip().lower().replace(" ", "_").replace("-", "_")
+        fractions = REGIONS.get(key)
+        if not fractions:
+            return None
+        left, top, right, bottom = fractions
+        return (round(left * screen_w), round(top * screen_h),
+                round(right * screen_w), round(bottom * screen_h))
+
+    if isinstance(region, (list, tuple)) and len(region) == 4:
+        x, y, w, h = (as_int(v, 0, -20000, 20000) for v in region)
+        return (x, y, x + max(w, 1), y + max(h, 1))
+
+    if isinstance(region, dict):
+        x = as_int(region.get("x"), 0, -20000, 20000)
+        y = as_int(region.get("y"), 0, -20000, 20000)
+        w = as_int(region.get("width", region.get("w")), 200, 1, 20000)
+        h = as_int(region.get("height", region.get("h")), 200, 1, 20000)
+        return (x, y, x + w, y + h)
+
+    return None
+
+
+def _prune_captures():
+    try:
+        frames = sorted(CAPTURE_DIR.glob("frame-*.png"))
+        for stale in frames[:-KEEP_CAPTURES]:
+            stale.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def capture(region=None):
+    """Grab the screen (or one region of it) and write it to disk.
+
+    PIL's ImageGrab is used rather than the PowerShell path in `desktop.py`
+    because this runs inside a perception loop — it takes tens of milliseconds
+    instead of a second or two.
+    """
+    blocked = _missing_capture()
+    if blocked:
+        return blocked
+
+    box = _resolve_region(region)
+    started = time.perf_counter()
+    try:
+        image = ImageGrab.grab(bbox=box, all_screens=False)
+    except Exception as exc:
+        return err("Could not capture the screen: " + str(exc))
+
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    name = "frame-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3] + ".png"
+    path = CAPTURE_DIR / name
+    image.save(path, "PNG", optimize=False)
+    _prune_captures()
+
+    return ok(
+        path=str(path),
+        view_url="/data/captures/" + name,
+        width=image.width,
+        height=image.height,
+        origin={"x": box[0] if box else 0, "y": box[1] if box else 0},
+        region=region or "full",
+        ms=round((time.perf_counter() - started) * 1000),
+    )
+
+
+# --------------------------------------------------------------------------
+# OCR
+# --------------------------------------------------------------------------
+
+async def _ocr_async(path):
+    """Run Windows' built-in OCR over a PNG, returning lines and words."""
+    from winsdk.windows.media.ocr import OcrEngine
+    from winsdk.windows.graphics.imaging import BitmapDecoder
+    from winsdk.windows.storage import StorageFile, FileAccessMode
+
+    engine = OcrEngine.try_create_from_user_profile_languages()
+    if engine is None:
+        raise RuntimeError(
+            "Windows has no OCR language pack installed for your display languages. "
+            "Add one under Settings > Time & language > Language & region.")
+
+    handle = await StorageFile.get_file_from_path_async(str(path))
+    stream = await handle.open_async(FileAccessMode.READ)
+    decoder = await BitmapDecoder.create_async(stream)
+    bitmap = await decoder.get_software_bitmap_async()
+    result = await engine.recognize_async(bitmap)
+
+    lines, words = [], []
+    for line in result.lines:
+        boxes = []
+        for word in line.words:
+            rect = word.bounding_rect
+            box = (round(rect.x), round(rect.y), round(rect.width), round(rect.height))
+            words.append({"text": word.text, "x": box[0], "y": box[1],
+                          "w": box[2], "h": box[3]})
+            boxes.append(box)
+        if not boxes:
+            continue
+        left = min(b[0] for b in boxes)
+        top = min(b[1] for b in boxes)
+        right = max(b[0] + b[2] for b in boxes)
+        bottom = max(b[1] + b[3] for b in boxes)
+        lines.append({"text": line.text, "x": left, "y": top,
+                      "w": right - left, "h": bottom - top})
+
+    return lines, words, engine.recognizer_language.display_name
+
+
+def read_text(path, origin=None):
+    """OCR one capture. Coordinates are shifted back to screen space."""
+    if not _WINOCR:
+        return err("OCR is unavailable. Install the Windows OCR bindings with "
+                   "`pip install -r requirements.txt`.")
+    try:
+        lines, words, language = asyncio.run(_ocr_async(path))
+    except Exception as exc:
+        return err("OCR failed: " + str(exc))
+
+    dx = (origin or {}).get("x", 0)
+    dy = (origin or {}).get("y", 0)
+    for item in lines + words:
+        item["x"] += dx
+        item["y"] += dy
+
+    return ok(lines=lines, words=words, language=language,
+              text="\n".join(line["text"] for line in lines))
+
+
+# --------------------------------------------------------------------------
+# Windows and the UI tree
+# --------------------------------------------------------------------------
+
+def active_window():
+    """Title, process and rectangle of whatever is in front."""
+    if not (_WIN32 and IS_WINDOWS):
+        return None
+    try:
+        handle = win32gui.GetForegroundWindow()
+        if not handle:
+            return None
+        left, top, right, bottom = win32gui.GetWindowRect(handle)
+        info = {
+            "title": win32gui.GetWindowText(handle),
+            "class": win32gui.GetClassName(handle),
+            "x": left, "y": top, "w": right - left, "h": bottom - top,
+            "app": None,
+        }
+        if psutil:
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(handle)
+                info["app"] = psutil.Process(pid).name()
+            except Exception:
+                pass
+        return info
+    except Exception:
+        return None
+
+
+def _ui_elements(limit=VISION_MAX_ELEMENTS, depth=8):
+    """Named, on-screen elements from the accessibility tree of the front window.
+
+    Returns (elements, note). The note explains an empty result — most often a
+    Chromium window that has not switched its accessibility tree on.
+    """
+    if not _UIA:
+        return [], "UI Automation is not installed."
+    if not _ensure_com():
+        return [], "Could not initialise COM on this thread for UI Automation."
+
+    try:
+        focused = _auto.GetForegroundControl()
+        if focused is None:
+            return [], "No foreground window."
+        top = focused.GetTopLevelControl()
+        if top is None:
+            return [], "No top-level window."
+    except Exception as exc:
+        return [], "Could not read the UI tree: " + str(exc)
+
+    elements = []
+    try:
+        for control, _depth in _auto.WalkControl(top, includeTop=False, maxDepth=depth):
+            try:
+                rect = control.BoundingRectangle
+                if rect.width() <= 0 or rect.height() <= 0:
+                    continue
+                name = (control.Name or "").strip()
+                type_name = control.ControlTypeName
+                if not name and type_name not in INTERACTIVE:
+                    continue
+                elements.append({
+                    "type": _SIMPLE_TYPE.get(type_name, type_name.replace("Control", "").lower()),
+                    "control_type": type_name,
+                    "text": name,
+                    "x": rect.left, "y": rect.top,
+                    "w": rect.width(), "h": rect.height(),
+                    "interactive": type_name in INTERACTIVE,
+                    "confidence": 1.0,     # the app's own description of itself
+                    "source": "uia",
+                })
+                if len(elements) >= limit * 3:
+                    break
+            except Exception:
+                continue
+    except Exception as exc:
+        return elements, "UI tree walk stopped early: " + str(exc)
+
+    note = None
+    if len(elements) <= 6:
+        note = ("This window exposes very little through UI Automation, which is "
+                "normal for Chrome and Electron apps. The OCR layer is the reliable "
+                "source of detail here.")
+    return elements, note
+
+
+# --------------------------------------------------------------------------
+# Merging into one scene
+# --------------------------------------------------------------------------
+
+def _overlap(a, b):
+    """Fraction of box `a` that sits inside box `b`."""
+    left = max(a["x"], b["x"])
+    top = max(a["y"], b["y"])
+    right = min(a["x"] + a["w"], b["x"] + b["w"])
+    bottom = min(a["y"] + a["h"], b["y"] + b["h"])
+    if right <= left or bottom <= top:
+        return 0.0
+    area = max(a["w"] * a["h"], 1)
+    return ((right - left) * (bottom - top)) / area
+
+
+def _normalise(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _merge(ui_elements, ocr_lines, limit):
+    """One element list from both sources, UIA winning on genuine overlaps."""
+    merged = []
+    for element in ui_elements:
+        merged.append(dict(element))
+
+    for line in ocr_lines:
+        candidate = {
+            "type": "text", "control_type": None, "text": line["text"],
+            "x": line["x"], "y": line["y"], "w": line["w"], "h": line["h"],
+            "interactive": False,
+            # Windows OCR reports no per-word confidence, so none is claimed.
+            "confidence": None,
+            "source": "ocr",
+        }
+        duplicate = False
+        for element in merged:
+            if element["source"] != "uia":
+                continue
+            if _overlap(candidate, element) > 0.7 and \
+               _normalise(candidate["text"]) in _normalise(element["text"]):
+                duplicate = True
+                break
+        if not duplicate:
+            merged.append(candidate)
+
+    # Interactive things first, then reading order. Keeps the useful ones when
+    # the list is trimmed for the model.
+    merged.sort(key=lambda e: (not e["interactive"], e["y"], e["x"]))
+    for index, element in enumerate(merged):
+        element["id"] = "e" + str(index)
+        element["cx"] = element["x"] + element["w"] // 2
+        element["cy"] = element["y"] + element["h"] // 2
+    return merged[:limit], len(merged)
+
+
+def observe(region=None, limit=VISION_MAX_ELEMENTS):
+    """One full perception pass: capture, OCR, UI tree, merged into a scene."""
+    frame = capture(region)
+    if not frame["ok"]:
+        return frame
+
+    window = active_window()
+    ui_elements, ui_note = _ui_elements(limit=limit)
+
+    # Element coordinates from UIA are screen-absolute; when only a region was
+    # captured, drop the ones that fall outside it so nothing is misreported.
+    if region:
+        box = _resolve_region(region)
+        if box:
+            crop = {"x": box[0], "y": box[1], "w": box[2] - box[0], "h": box[3] - box[1]}
+            ui_elements = [e for e in ui_elements if _overlap(e, crop) > 0.5]
+
+    text = read_text(frame["path"], frame["origin"])
+    ocr_lines = text.get("lines", []) if text["ok"] else []
+
+    elements, total = _merge(ui_elements, ocr_lines, limit)
+
+    scene = ok(
+        frame={"view_url": frame["view_url"], "path": frame["path"],
+               "width": frame["width"], "height": frame["height"],
+               "region": frame["region"], "origin": frame["origin"]},
+        window=window,
+        elements=elements,
+        element_count=total,
+        shown=len(elements),
+        text=text.get("text", "") if text["ok"] else "",
+        ocr_ok=text["ok"],
+        sources={"uia": len(ui_elements), "ocr": len(ocr_lines)},
+        ms=frame["ms"],
+    )
+    notes = [n for n in (ui_note, None if text["ok"] else text.get("error")) if n]
+    if notes:
+        scene["notes"] = notes
+    return scene
+
+
+# --------------------------------------------------------------------------
+# Finding things
+# --------------------------------------------------------------------------
+
+def _score(element, needle):
+    """How well an element matches a target description. 0 means no match."""
+    text = _normalise(element["text"])
+    if not text:
+        return 0.0
+    if text == needle:
+        base = 1.0
+    elif text.startswith(needle) or text.endswith(needle):
+        base = 0.85
+    elif needle in text:
+        base = 0.7
+    else:
+        # Every word of the query has to appear somewhere in the label.
+        parts = [p for p in needle.split() if len(p) > 2]
+        if parts and all(p in text for p in parts):
+            base = 0.55
+        else:
+            return 0.0
+    if element["interactive"]:
+        base += 0.12
+    if element["source"] == "uia":
+        base += 0.06
+    return round(min(base, 1.0), 3)
+
+
+def locate(target, region=None):
+    """Find everything on screen matching a description, best match first."""
+    needle = _normalise(target)
+    if not needle:
+        return err("No target given. Say what to look for, for example 'the Submit button'.")
+
+    scene = observe(region)
+    if not scene["ok"]:
+        return scene
+
+    # "the submit button" -> "submit", so the type word does not fight the label.
+    type_words = ("button", "link", "field", "box", "input", "tab", "menu",
+                  "checkbox", "icon", "option")
+    wanted_type = next((w for w in type_words if re.search(r"\b" + w + r"\b", needle)), None)
+    cleaned = re.sub(r"\b(the|a|an|" + "|".join(type_words) + r")\b", " ", needle)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip() or needle
+
+    matches = []
+    for element in scene["elements"]:
+        score = _score(element, cleaned)
+        if not score:
+            continue
+        if wanted_type and wanted_type in ("button", "link", "input", "tab", "checkbox"):
+            expected = {"button": "button", "link": "link", "input": "input",
+                        "tab": "tab", "checkbox": "checkbox"}[wanted_type]
+            if element["type"] == expected:
+                score = min(score + 0.15, 1.0)
+        matches.append(dict(element, match=score))
+
+    matches.sort(key=lambda m: m["match"], reverse=True)
+
+    if not matches:
+        return err("Nothing on screen matches '" + str(target) + "'. "
+                   "Visible text includes: " +
+                   ", ".join(e["text"][:24] for e in scene["elements"][:8] if e["text"]))
+
+    return ok(target=str(target),
+              matches=matches[:8],
+              best=matches[0],
+              window=scene["window"],
+              frame=scene["frame"])
+
+
+# --------------------------------------------------------------------------
+# Acting, then looking again
+# --------------------------------------------------------------------------
+
+def _click_at(x, y, double=False):
+    user32 = ctypes.windll.user32
+    user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.04)
+    for _ in range(2 if double else 1):
+        user32.mouse_event(0x0002, 0, 0, 0, 0)   # left down
+        user32.mouse_event(0x0004, 0, 0, 0, 0)   # left up
+        if double:
+            time.sleep(0.06)
+
+
+def click_element(target, double=False, confirm=False):
+    """Find something on screen, click it, then look again to verify."""
+    if not IS_WINDOWS:
+        return err("Clicking only works on Windows.")
+
+    found = locate(target)
+    if not found["ok"]:
+        return found
+
+    best = found["best"]
+    if best["match"] < 0.5:
+        return err("The closest match to '" + str(target) + "' was '" + best["text"] +
+                   "' at only " + str(best["match"]) + " confidence. Too uncertain to "
+                   "click — be more specific about what to press.")
+
+    before = {"title": (found["window"] or {}).get("title"),
+              "text_length": None}
+    before_scene = None
+
+    try:
+        _click_at(best["cx"], best["cy"], double=bool(double))
+    except Exception as exc:
+        return err("Could not click: " + str(exc))
+
+    # Observe again. An action is not finished until its effect is confirmed.
+    time.sleep(0.55)
+    after = observe()
+    changed = False
+    detail = "Could not re-read the screen to verify."
+    if after["ok"]:
+        after_window = (after.get("window") or {}).get("title")
+        changed = after_window != before["title"] or \
+            after.get("text", "")[:400] != (before_scene or {}).get("text", "")[:400]
+        detail = ("The screen changed after the click."
+                  if changed else
+                  "The screen looks the same as before — the click may not have registered.")
+
+    return ok(
+        clicked={"text": best["text"], "type": best["type"],
+                 "x": best["cx"], "y": best["cy"],
+                 "confidence": best["match"], "source": best["source"]},
+        double=bool(double),
+        verified=changed,
+        verification=detail,
+        window_before=before["title"],
+        window_after=(after.get("window") or {}).get("title") if after["ok"] else None,
+        frame=after.get("frame") if after["ok"] else None,
+    )
+
+
+# --------------------------------------------------------------------------
+# Understanding: the vision model, when there is one
+# --------------------------------------------------------------------------
+
+def _describe_scene(scene, question=None):
+    """A written account of the scene, from grounded facts only."""
+    window = scene.get("window") or {}
+    lines = []
+    if window.get("title"):
+        lines.append("Active window: " + window["title"] +
+                     (" (" + window["app"] + ")" if window.get("app") else ""))
+    lines.append("Screen: " + str(scene["frame"]["width"]) + "x" +
+                 str(scene["frame"]["height"]) + ", region " + str(scene["frame"]["region"]))
+
+    interactive = [e for e in scene["elements"] if e["interactive"]]
+    if interactive:
+        lines.append("")
+        lines.append("Interactive elements (from the accessibility tree):")
+        for element in interactive[:20]:
+            lines.append("- " + element["type"] + " \"" + element["text"][:60] +
+                         "\" at (" + str(element["cx"]) + "," + str(element["cy"]) + ")")
+
+    if scene.get("text"):
+        lines.append("")
+        lines.append("Text visible on screen:")
+        lines.append(scene["text"][:2600])
+
+    if question:
+        lines.append("")
+        lines.append("The user asked: " + str(question))
+    return "\n".join(lines)
+
+
+async def _ask_vision_model(model, image_path, question):
+    """One-shot image question against a vision-capable Ollama model."""
+    import httpx
+    from .config import OLLAMA_HOST, REQUEST_TIMEOUT
+
+    with open(image_path, "rb") as handle:
+        encoded = base64.b64encode(handle.read()).decode("ascii")
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [{
+            "role": "user",
+            "content": question,
+            "images": [encoded],
+        }],
+        "options": {"temperature": 0.2},
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)) as client:
+        response = await client.post(OLLAMA_HOST + "/api/chat", json=payload)
+        response.raise_for_status()
+        body = response.json()
+    return (body.get("message") or {}).get("content", "").strip()
+
+
+def look_at_screen(question=None, region=None):
+    """Look at the screen and answer a question about it.
+
+    With a vision-capable model installed the image itself is interpreted. With
+    none, the grounded scene — window, accessibility tree and OCR text — is
+    returned instead, clearly marked so the answer is never passed off as
+    having come from looking at pixels.
+    """
+    from . import models
+
+    scene = observe(region)
+    if not scene["ok"]:
+        return scene
+
+    route = asyncio.run(models.route_vision())
+    description = _describe_scene(scene, question)
+
+    if route.degraded or not route.model:
+        return ok(
+            mode="grounded",
+            vision_model=None,
+            degraded=True,
+            limitation=route.explanation,
+            window=scene.get("window"),
+            observation=description,
+            elements=scene["elements"][:30],
+            text=scene.get("text", "")[:3000],
+            frame=scene["frame"],
+            note="This is read from the accessibility tree and OCR text, not from "
+                 "interpreting the image. " + (route.explanation or ""),
+        )
+
+    prompt = (question or "Describe what is on this screen, briefly and concretely.")
+    grounded = ("Here is what the operating system reports about this screen. Use it "
+                "to ground your answer, and correct it if the image disagrees.\n\n"
+                + description + "\n\nQuestion: " + prompt)
+    try:
+        answer = asyncio.run(_ask_vision_model(route.model, scene["frame"]["path"], grounded))
+    except Exception as exc:
+        return ok(
+            mode="grounded",
+            vision_model=route.model,
+            degraded=True,
+            limitation="The vision model failed: " + str(exc),
+            window=scene.get("window"),
+            observation=description,
+            elements=scene["elements"][:30],
+            frame=scene["frame"],
+        )
+
+    return ok(
+        mode="vision",
+        vision_model=route.model,
+        degraded=False,
+        answer=answer,
+        window=scene.get("window"),
+        elements=scene["elements"][:30],
+        frame=scene["frame"],
+    )
+
+
+# --------------------------------------------------------------------------
+# Tools
+# --------------------------------------------------------------------------
+
+def tool_look(question=None, region=None):
+    return look_at_screen(question, region)
+
+
+def tool_read(region=None):
+    """Just the text, for when the model only needs to read something."""
+    frame = capture(region)
+    if not frame["ok"]:
+        return frame
+    text = read_text(frame["path"], frame["origin"])
+    if not text["ok"]:
+        return text
+    window = active_window()
+    return ok(text=text["text"], lines=text["lines"], language=text["language"],
+              window=window, frame={"view_url": frame["view_url"],
+                                    "width": frame["width"], "height": frame["height"]})
+
+
+def tool_find(target, region=None):
+    return locate(target, region)
+
+
+def tool_click(target, double=False):
+    return click_element(target, double=as_bool(double))
+
+
+def tool_window():
+    window = active_window()
+    if not window:
+        return err("Could not identify the active window.")
+    elements, note = _ui_elements()
+    result = ok(window=window, elements=elements[:40], element_count=len(elements))
+    if note:
+        result["note"] = note
+    return result
+
+
+def tool_capabilities():
+    """What the visual layer can do here, and what is missing."""
+    from . import models
+    state = available()
+    route = asyncio.run(models.route_vision())
+    return ok(
+        capabilities=state,
+        vision_model=route.model,
+        vision_available=not route.degraded,
+        limitation=route.explanation,
+        summary=("Screen capture, OCR and UI grounding are working."
+                 if state["capture"] and state["ocr"] and state["ui_tree"]
+                 else "Some visual capabilities are unavailable; see `capabilities`."),
+    )
+
+
+SCHEMAS = [
+    tool("look_at_screen",
+         "Look at the user's screen and answer a question about what is on it. Use "
+         "this for 'what am I looking at', 'what's wrong with this', 'explain this "
+         "screen', or any question about something the user can see but has not "
+         "described. Reads the window, its accessibility tree and all visible text.",
+         {"question": string("What to find out about the screen."),
+          "region": string("Optional part of the screen to look at.",
+                           ["full", "top", "bottom", "left", "right", "centre",
+                            "top_left", "top_right", "bottom_left", "bottom_right"])}),
+    tool("read_screen_text",
+         "Read all the text currently visible on screen, with no interpretation. Use "
+         "this to read an error message, a document, or anything the user points at.",
+         {"region": string("Optional part of the screen to read.",
+                           ["full", "top", "bottom", "left", "right", "centre",
+                            "top_left", "top_right", "bottom_left", "bottom_right"])}),
+    tool("find_on_screen",
+         "Locate something on screen by its label and get its exact coordinates. Use "
+         "before clicking, or to answer 'where is the X button'.",
+         {"target": string("What to look for, for example 'Submit button' or 'Sign in'."),
+          "region": string("Optional part of the screen to search.")},
+         ["target"]),
+    tool("click_on_screen",
+         "Click something on screen by describing it. Finds the element, clicks it, "
+         "then looks again to confirm the screen actually changed. Only use when the "
+         "user asked for something to be clicked or pressed.",
+         {"target": string("What to click, for example 'the Save button'."),
+          "double": boolean("Double-click instead of a single click.")},
+         ["target"]),
+    tool("describe_active_window",
+         "Identify the window in front and list its interactive elements. Cheaper "
+         "than a full look when only the app and its controls matter."),
+    tool("vision_status",
+         "Report what the visual layer can do on this machine and what is missing, "
+         "including whether a vision-capable model is installed."),
+]
+
+
+REGISTRY = {
+    "look_at_screen": tool_look,
+    "read_screen_text": tool_read,
+    "find_on_screen": tool_find,
+    "click_on_screen": tool_click,
+    "describe_active_window": tool_window,
+    "vision_status": tool_capabilities,
+}

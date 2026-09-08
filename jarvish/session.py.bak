@@ -1,0 +1,174 @@
+"""Per-session state: continuity, the activity trail, and the emergency stop.
+
+A session is one browser tab's conversation with Jarvish. It holds more than
+the transcript: the tools that ran, what the last action was (so "do that
+again" means something), pending confirmations, and a cancel flag the agent
+loop checks between steps so the STOP control can actually halt work mid-chain.
+"""
+
+import asyncio
+import threading
+import time
+import uuid
+from collections import deque
+
+# Sessions are dropped after this long without traffic, so a browser left open
+# overnight does not pin an unbounded amount of history in memory.
+IDLE_TIMEOUT = 60 * 60 * 6
+MAX_ACTIVITY = 400
+MAX_TOOL_MEMORY = 40
+
+
+class Session:
+    def __init__(self, session_id):
+        self.id = session_id
+        self.created = time.time()
+        self.touched = time.time()
+
+        # Rolling log the HUD renders as its activity stream.
+        self.activity = deque(maxlen=MAX_ACTIVITY)
+        # Every tool call that has run this session, newest last.
+        self.tool_history = deque(maxlen=MAX_TOOL_MEMORY)
+
+        # Set when the user hits STOP; the agent loop checks it between steps.
+        self.cancel = asyncio.Event()
+        # Confirmations the UI has approved, keyed by the request id we handed it.
+        self.approvals = {}
+        self.state = "idle"
+        # Background tasks have nobody watching the screen, so they are
+        # allowed to wait far longer for a confirmation than a chat turn.
+        self.background = False
+        self.approval_wait = None
+        # A mission agent restricts itself to these capability groups.
+        self.capability_groups = None
+
+    # -- continuity ------------------------------------------------------
+
+    def note_tool(self, name, arguments, result):
+        ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
+        self.tool_history.append({
+            "name": name,
+            "arguments": arguments,
+            "ok": ok,
+            "at": time.time(),
+        })
+
+    def last_tool(self, only_successful=True):
+        for entry in reversed(self.tool_history):
+            if entry["ok"] or not only_successful:
+                return entry
+        return None
+
+    def continuity_block(self):
+        """A short recap of recent actions, folded into the system prompt.
+
+        This is what lets "do that again" or "open the one from earlier"
+        resolve without the user restating everything.
+        """
+        if not self.tool_history:
+            return ""
+        recent = list(self.tool_history)[-6:]
+        lines = ["Actions you have already taken in this session, oldest first:"]
+        for entry in recent:
+            arguments = ", ".join(
+                str(k) + "=" + str(v) for k, v in (entry["arguments"] or {}).items()
+            )
+            lines.append(
+                "- " + entry["name"] + ("(" + arguments + ")" if arguments else "")
+                + ("" if entry["ok"] else "  [failed]")
+            )
+        lines.append(
+            'If the user says "do that again", "the same one", "continue" or similar, '
+            "resolve it against this list instead of asking them to repeat themselves."
+        )
+        return "\n".join(lines)
+
+    # -- activity trail --------------------------------------------------
+
+    def log(self, kind, text, detail=None):
+        entry = {
+            "at": time.time(),
+            "kind": kind,
+            "text": text,
+            "detail": detail,
+        }
+        self.activity.append(entry)
+        return entry
+
+    def trail(self, limit=120):
+        return list(self.activity)[-limit:]
+
+    # -- confirmation gate -----------------------------------------------
+
+    def request_approval(self, request_id):
+        """Open a pending confirmation and hand back the event to await."""
+        pending = {"event": asyncio.Event(), "approved": False}
+        self.approvals[request_id] = pending
+        return pending
+
+    def resolve_approval(self, request_id, approved):
+        """Answer a pending confirmation. False when nothing was waiting."""
+        pending = self.approvals.get(request_id)
+        if pending is None:
+            return False
+        pending["approved"] = bool(approved)
+        pending["event"].set()
+        return True
+
+    def drop_approval(self, request_id):
+        self.approvals.pop(request_id, None)
+
+    # -- lifecycle -------------------------------------------------------
+
+    def touch(self):
+        self.touched = time.time()
+
+    def stop(self):
+        self.cancel.set()
+        self.state = "stopped"
+        # Release anything blocked on a confirmation, denying it as we go.
+        for request_id in list(self.approvals):
+            self.resolve_approval(request_id, False)
+        self.log("stop", "Emergency stop — all activity halted")
+
+    def rearm(self):
+        self.cancel = asyncio.Event()
+
+    @property
+    def stopped(self):
+        return self.cancel.is_set()
+
+
+_sessions = {}
+_lock = threading.Lock()
+
+
+def get(session_id=None):
+    """Fetch a session, creating it if the id is new or missing."""
+    with _lock:
+        _reap()
+        if not session_id:
+            session_id = uuid.uuid4().hex[:12]
+        session = _sessions.get(session_id)
+        if session is None:
+            session = Session(session_id)
+            _sessions[session_id] = session
+        session.touch()
+        return session
+
+
+def peek(session_id):
+    """Fetch a session without creating one. None when it does not exist."""
+    with _lock:
+        return _sessions.get(session_id)
+
+
+def _reap():
+    cutoff = time.time() - IDLE_TIMEOUT
+    for key in [k for k, v in _sessions.items() if v.touched < cutoff]:
+        _sessions.pop(key, None)
+
+
+def count():
+    with _lock:
+        return len(_sessions)

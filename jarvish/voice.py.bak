@@ -1,0 +1,721 @@
+"""Persistent voice: the microphone belongs to the backend, not to a browser tab.
+
+The HUD used to own the microphone through the Web Speech API, which is scoped to
+the document. The moment anything else took the foreground — YouTube opening in
+the same window, VS Code, Explorer — Chrome stopped delivering audio and Jarvish
+went deaf while still showing MIC ON. That is worse than not listening at all.
+
+So capture moved here. `sounddevice` reads the operating system's microphone from
+inside the server process, which has no notion of which window is focused, and
+`faster-whisper` transcribes locally. Nothing is streamed to Ollama; the model is
+not consulted until a wake word has been heard and a whole utterance transcribed.
+
+The pipeline is deliberately the existing one:
+
+    microphone -> VAD -> whisper -> wake word -> llm.run_agent -> reply
+
+`run_agent` is the same entry point the typed HUD uses, so the risk gate, the
+autonomy ceiling, tool validation, confirmations and cancellation all apply to a
+spoken command exactly as they do to a typed one. There is no voice tool router
+and no second agent — a spoken sentence is just another way of arriving at the
+same loop.
+"""
+
+import json
+import os
+import queue
+import subprocess
+import threading
+import time
+
+from .config import WAKE_WORD
+from .util import as_bool, boolean, err, ok, string, tool
+
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
+
+# `tiny` on CPU, int8: measured at ~420 ms per utterance and 5.7-8.9x realtime,
+# transcribing every test phrase exactly. `base` was no more accurate on the same
+# phrases and took 1.8x as long. CPU rather than CUDA is a deliberate choice —
+# qwen3:8b already holds 4.1 GB of the 6 GB card, and taking VRAM from the model
+# that answers to speed up the model that listens is the wrong trade.
+MODEL_SIZE = os.environ.get("JARVISH_WHISPER_MODEL", "tiny").strip()
+DEVICE = os.environ.get("JARVISH_WHISPER_DEVICE", "cpu").strip()
+COMPUTE = os.environ.get("JARVISH_WHISPER_COMPUTE", "int8").strip()
+
+SAMPLE_RATE = 16000
+BLOCK = 1600                     # 100 ms of audio per callback
+
+# Which input to listen on. Empty means the system default. A name fragment or an
+# index both work — laptops routinely expose the same array three times, and the
+# default is not always the one with the working driver.
+INPUT_DEVICE = os.environ.get("JARVISH_VOICE_DEVICE", "").strip()
+
+# Where speech comes out. "browser" uses the HUD's speechSynthesis, which needs
+# the page open and — like the microphone before it — may be throttled when the
+# window is not focused. "server" speaks through Windows' own voice from this
+# process, which no window can silence. Default is server when voice is on at
+# all, because a persistent microphone whose answers only play in a tab you are
+# not looking at is half a feature.
+SPEAK_WITH = os.environ.get("JARVISH_VOICE_OUT", "server").strip().lower()
+
+# Energy gate. Speech is detected by loudness against a noise floor the stream
+# keeps learning, so a quiet room and a noisy one both work without a setting.
+SILENCE_BLOCKS = 9               # ~0.9 s of quiet ends an utterance
+MIN_SPEECH_BLOCKS = 3            # ignore a click or a cough
+MAX_UTTERANCE_BLOCKS = 150       # 15 s hard ceiling on one utterance
+FLOOR_MARGIN = 3.0               # speech is this many times the noise floor
+ABSOLUTE_FLOOR = 0.004           # below this nothing counts as speech
+
+# The same sentence transcribed twice inside this window is one command. Whisper
+# can emit a repeat when an utterance straddles two captures, and executing a
+# command twice is the kind of bug that opens two YouTube tabs.
+DEDUPE_SECONDS = 6.0
+
+# Said alone, these stop whatever Jarvish is saying or doing. Handled before the
+# model is called, because "stop" has to work when the model is the thing stuck.
+STOP_WORDS = ("stop", "cancel", "quiet", "shut up", "abort", "never mind")
+
+# Answers to a confirmation. A gated action asked about aloud has to be
+# answerable aloud, or the HUD becomes mandatory again for exactly the requests
+# that matter most. This is not a weakening of the gate: the gate still fires,
+# still describes the action, and still waits. Only the answer arrives by voice.
+YES_WORDS = ("yes", "yeah", "yep", "go ahead", "do it", "confirm", "approved",
+             "approve", "okay", "ok", "sure", "affirmative", "proceed")
+NO_WORDS = ("no", "nope", "don't", "do not", "cancel", "stop", "deny", "decline",
+            "negative", "forget it", "never mind")
+
+STATES = ("off", "listening", "processing", "speaking", "confirming", "error")
+
+# --------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------
+
+_lock = threading.RLock()
+_state = {
+    "state": "off",
+    "since": time.time(),
+    "error": None,
+    "heard": None,          # last transcript that passed the wake word
+    "reply": None,          # last spoken answer, for the HUD to read out
+    "reply_id": 0,          # increments so the HUD speaks each reply once
+    "transcripts": [],      # recent transcripts, newest last, for the HUD
+    "commands": 0,
+    "rejected": 0,          # heard, but no wake word
+    "device": None,
+    "model": None,
+    "stt_ms": None,
+    "last_error_at": None,
+    "pending": None,        # a gated action waiting on a spoken yes or no
+}
+
+_worker = None
+_stop_flag = threading.Event()
+_audio = queue.Queue()
+_model = None
+_model_lock = threading.Lock()
+
+# The voice conversation is one continuous session so that "open the first one"
+# resolves against "search YouTube for Python tutorials" — the same continuity
+# the typed HUD gets, not a separate memory.
+VOICE_SESSION = "voice"
+_history = []
+HISTORY_TURNS = 12
+
+
+def available():
+    """Whether this machine can actually do persistent voice, and why not."""
+    missing = []
+    for module in ("sounddevice", "faster_whisper"):
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        return False, ("Missing: " + ", ".join(missing) +
+                       ". Install with: python -m pip install " + " ".join(missing))
+    try:
+        import sounddevice as sd
+        inputs = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
+        if not inputs:
+            return False, "No microphone found."
+    except Exception as exc:
+        return False, "Audio system unavailable: " + str(exc)
+    return True, None
+
+
+def _set_state(name, **fields):
+    with _lock:
+        if name and name != _state["state"]:
+            _state["state"] = name
+            _state["since"] = time.time()
+        _state.update(fields)
+
+
+def status():
+    """Everything the HUD needs to mirror the microphone, in one read."""
+    with _lock:
+        snapshot = dict(_state)
+    snapshot["listening"] = snapshot["state"] not in ("off", "error")
+    snapshot["wake_word"] = WAKE_WORD
+    snapshot["transcripts"] = snapshot["transcripts"][-8:]
+    can, why = available()
+    snapshot["available"] = can
+    snapshot["unavailable_reason"] = why
+    return ok(**snapshot)
+
+
+# --------------------------------------------------------------------------
+# Speech to text
+# --------------------------------------------------------------------------
+
+def _load_model():
+    """Load Whisper once, on first use rather than at import.
+
+    Import time matters: `new.py --check` and the test suite both import this
+    module, and neither should pay for a model they are not going to run.
+    """
+    global _model
+    with _model_lock:
+        if _model is not None:
+            return _model
+        from faster_whisper import WhisperModel
+        _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
+        _set_state(None, model=MODEL_SIZE + "/" + DEVICE + "/" + COMPUTE)
+        return _model
+
+
+def transcribe(samples):
+    """Turn one utterance into text. Returns (text, milliseconds)."""
+    model = _load_model()
+    started = time.perf_counter()
+    segments, _info = model.transcribe(samples, language="en", beam_size=1,
+                                       vad_filter=False)
+    text = " ".join(segment.text for segment in segments).strip()
+    return text, round((time.perf_counter() - started) * 1000, 1)
+
+
+# --------------------------------------------------------------------------
+# Wake word
+# --------------------------------------------------------------------------
+
+def _normalise(text):
+    return "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in text)
+
+
+def split_wake_word(text, wake=None):
+    """The command after the wake word, or None if it was never said.
+
+    Whisper writes the wake word however it heard it — "Jarvis,", "Jarvis.",
+    "jarvis" — so matching is done on normalised words rather than a prefix.
+    """
+    wake = (wake or WAKE_WORD).lower()
+    words = _normalise(text).split()
+    if not words:
+        return None
+    for index, word in enumerate(words):
+        # Accept near-misses: "jarvis" is routinely heard as "jarvis's" or
+        # "jarviss", and refusing those makes the assistant feel deaf.
+        if word == wake or (len(word) > 3 and word.startswith(wake)):
+            rest = " ".join(words[index + 1:]).strip()
+            return rest
+    return None
+
+
+def classify_answer(command):
+    """A spoken yes/no, or None if this is not an answer at all.
+
+    Deliberately strict: only a short utterance that is essentially the word
+    counts. "Yes" approves; "yes but change the file first" is a new request,
+    not consent, and must not be read as approval for something irreversible.
+    """
+    cleaned = " ".join(_normalise(command).split())
+    if not cleaned or len(cleaned.split()) > 3:
+        return None
+    for word in NO_WORDS:            # checked first: "cancel" is in both lists
+        if cleaned == word:
+            return False
+    for word in YES_WORDS:
+        if cleaned == word:
+            return True
+    return None
+
+
+def is_stop_command(command):
+    """Whether this is 'stop' and nothing else."""
+    cleaned = " ".join(_normalise(command).split())
+    return cleaned in STOP_WORDS
+
+
+# --------------------------------------------------------------------------
+# Dispatch into the existing agent
+# --------------------------------------------------------------------------
+
+def _remember(role, content):
+    _history.append({"role": role, "content": content})
+    del _history[:-HISTORY_TURNS]
+
+
+def dispatch(command):
+    """Run a spoken command through the ordinary agent loop.
+
+    Returns the reply text. Everything that governs a typed request governs this
+    one, because it is the same call: `run_agent` applies the risk gate and the
+    autonomy ceiling itself, and a gated tool will sit waiting for approval in
+    the HUD rather than running because the request arrived by microphone.
+    """
+    import asyncio
+
+    from . import llm, session as session_mod
+
+    session = session_mod.get(VOICE_SESSION)
+    session.rearm()
+    _remember("user", command)
+    history = list(_history)
+
+    reply = []
+
+    async def drive():
+        async for event in llm.run_agent(history, session=session):
+            kind = event.get("type")
+            if kind == "confirm":
+                # The agent is holding a gated action. Announce it and record
+                # what is waiting, so the listen loop can accept a spoken
+                # answer. Nothing is approved here — run_agent stays blocked
+                # until someone actually says yes, or it times out and refuses.
+                spoken = ("%s needs your approval. %s. Say yes to run it, or no."
+                          % (event.get("name", "An action"),
+                             event.get("reason") or "It cannot be undone"))
+                with _lock:
+                    _state["pending"] = {
+                        "id": event.get("id"),
+                        "name": event.get("name"),
+                        "risk": event.get("risk"),
+                        "reason": event.get("reason"),
+                        "preview": event.get("preview"),
+                        "at": time.time(),
+                    }
+                    _state["reply"] = spoken
+                    _state["reply_id"] += 1
+                _set_state("confirming", heard=_state.get("heard"))
+                continue
+            if kind == "token":
+                reply.append(event.get("text") or event.get("token") or "")
+            elif kind == "done" and event.get("content"):
+                # `done` carries the whole answer; prefer it when streaming
+                # produced nothing (a tool-only turn).
+                if not reply:
+                    reply.append(event["content"])
+            elif kind == "error":
+                reply.append(event.get("message") or "Something failed.")
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(drive())
+    finally:
+        loop.close()
+
+    with _lock:
+        _state["pending"] = None
+
+    answer = "".join(reply).strip()
+    if answer:
+        _remember("assistant", answer)
+    return answer
+
+
+# --------------------------------------------------------------------------
+# The capture loop
+# --------------------------------------------------------------------------
+
+def _resolve_device():
+    """The configured input, as an index sounddevice will accept, or None."""
+    if not INPUT_DEVICE:
+        return None
+    import sounddevice as sd
+    if INPUT_DEVICE.isdigit():
+        return int(INPUT_DEVICE)
+    wanted = INPUT_DEVICE.lower()
+    for index, entry in enumerate(sd.query_devices()):
+        if entry["max_input_channels"] > 0 and wanted in entry["name"].lower():
+            return index
+    return None          # named device is gone; fall back rather than refuse
+
+
+def _rms(block):
+    import numpy as np
+    return float(np.sqrt(np.mean(np.square(block))))
+
+
+def _listen_loop():
+    """Capture, segment, transcribe, and hand commands to the agent.
+
+    Runs until `stop()`. Every failure is caught and reported through the state
+    rather than killing the thread, because a microphone that gives up silently
+    is the problem this module exists to fix.
+    """
+    import numpy as np
+    import sounddevice as sd
+
+    try:
+        _load_model()
+    except Exception as exc:
+        _set_state("error", error="Could not load Whisper: " + str(exc),
+                   last_error_at=time.time())
+        return
+
+    def callback(indata, _frames, _time_info, status_flags):
+        if status_flags:
+            pass          # overflows are survivable; dropping audio is not fatal
+        _audio.put(indata.copy())
+
+    floor = ABSOLUTE_FLOOR
+    speech = []
+    quiet = 0
+    recent = {}
+
+    device = _resolve_device()
+    try:
+        device_name = sd.query_devices(device if device is not None
+                                       else sd.default.device[0])["name"]
+    except Exception:
+        device_name = "default"
+    _set_state("listening", device=device_name, error=None)
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                            blocksize=BLOCK, callback=callback, device=device):
+            while not _stop_flag.is_set():
+                try:
+                    block = _audio.get(timeout=0.3)
+                except queue.Empty:
+                    continue
+
+                mono = block.reshape(-1)
+                level = _rms(mono)
+
+                # Learn the room while nobody is talking.
+                if not speech:
+                    floor = max(ABSOLUTE_FLOOR, floor * 0.95 + level * 0.05)
+
+                loud = level > max(ABSOLUTE_FLOOR, floor * FLOOR_MARGIN)
+
+                if loud:
+                    speech.append(mono)
+                    quiet = 0
+                    if len(speech) > MAX_UTTERANCE_BLOCKS:
+                        loud = False        # force the utterance closed below
+                elif speech:
+                    quiet += 1
+                    speech.append(mono)
+
+                closed = speech and (quiet >= SILENCE_BLOCKS or
+                                     len(speech) > MAX_UTTERANCE_BLOCKS)
+                if not closed:
+                    continue
+
+                utterance = np.concatenate(speech)
+                spoken_blocks = len(speech) - quiet
+                speech, quiet = [], 0
+
+                if spoken_blocks < MIN_SPEECH_BLOCKS:
+                    continue
+
+                # Anything said while Jarvish is thinking or talking is still
+                # captured, but only "stop" is acted on — otherwise the assistant
+                # answers its own voice coming out of the speakers.
+                busy = _state["state"] in ("processing", "speaking")
+
+                try:
+                    text, stt_ms = transcribe(utterance)
+                except Exception as exc:
+                    _set_state(None, error="Transcription failed: " + str(exc),
+                               last_error_at=time.time())
+                    continue
+
+                if not text:
+                    continue
+
+                with _lock:
+                    _state["transcripts"] = (_state["transcripts"] + [text])[-8:]
+                    _state["stt_ms"] = stt_ms
+
+                command = split_wake_word(text)
+                if command is None:
+                    with _lock:
+                        _state["rejected"] += 1
+                    continue
+                if not command:
+                    continue          # just the wake word, nothing after it
+
+                now = time.time()
+                key = " ".join(_normalise(command).split())
+                if now - recent.get(key, 0) < DEDUPE_SECONDS:
+                    continue
+                recent[key] = now
+                for old in [k for k, at in recent.items() if now - at > 60]:
+                    recent.pop(old, None)
+
+                # A gated action is waiting: a bare yes or no answers it, and
+                # anything else is left alone rather than guessed at.
+                with _lock:
+                    waiting = _state.get("pending") is not None
+                if waiting:
+                    verdict = classify_answer(command)
+                    if verdict is not None:
+                        answer_pending(verdict)
+                        continue
+                    if is_stop_command(command):
+                        answer_pending(False)
+                        _interrupt()
+                        continue
+                    continue          # not an answer; keep waiting
+
+                if is_stop_command(command):
+                    _interrupt()
+                    continue
+
+                if busy:
+                    continue          # a command arrived mid-answer; ignore it
+
+                _handle(command)
+
+    except Exception as exc:
+        _set_state("error", error="Microphone stopped: " + str(exc),
+                   last_error_at=time.time())
+        return
+
+    _set_state("off", error=None)
+
+
+def answer_pending(approved):
+    """Resolve the gated action that is waiting, by voice.
+
+    The authority is the same as clicking the button in the HUD: it is the user
+    saying yes to a described action that the risk gate stopped. What it must
+    never become is an approval nobody gave, so it refuses when nothing is
+    actually waiting rather than inventing one.
+    """
+    from . import session as session_mod
+
+    with _lock:
+        pending = _state.get("pending")
+    if not pending:
+        return err("Nothing is waiting for approval.")
+
+    session = session_mod.get(VOICE_SESSION)
+    resolved = session.resolve_approval(pending["id"], bool(approved))
+    with _lock:
+        _state["pending"] = None
+    if not resolved:
+        _set_state("processing")
+        return err("That approval had already expired.")
+
+    session.log("confirm", ("Approved" if approved else "Declined") + " by voice")
+    _set_state("processing")
+    return ok(approved=bool(approved), name=pending.get("name"))
+
+
+def _interrupt():
+    """'Jarvis, stop' — halt speech and any running tool chain, keep listening."""
+    from . import session as session_mod
+
+    silence_speech()
+    try:
+        session_mod.get(VOICE_SESSION).stop()
+    except Exception:
+        pass
+    with _lock:
+        _state["pending"] = None
+        _state["reply"] = ""
+        _state["reply_id"] += 1        # a new id with empty text cancels the HUD
+    if not _stop_flag.is_set():
+        _set_state("listening", error=None)
+
+
+def _handle(command):
+    """Take one command through the agent and publish the answer."""
+    _set_state("processing", heard=command, error=None)
+    try:
+        answer = dispatch(command)
+    except Exception as exc:
+        _set_state("listening", error="Agent failed: " + str(exc),
+                   last_error_at=time.time())
+        return
+
+    with _lock:
+        _state["commands"] += 1
+        _state["reply"] = answer
+        _state["reply_id"] += 1
+
+    if not answer:
+        _set_state("listening")
+        return
+
+    _set_state("speaking")
+    if SPEAK_WITH == "server":
+        # Speak here, so the answer is audible whatever window has focus.
+        _speak_server(answer)
+        while speaking() and not _stop_flag.is_set():
+            time.sleep(0.2)
+        if _state["state"] == "speaking":
+            _set_state("listening")
+    # Otherwise the HUD speaks and calls /api/voice/spoken when it is done.
+
+
+# --------------------------------------------------------------------------
+# Control
+# --------------------------------------------------------------------------
+
+def start():
+    """Turn the microphone on. It stays on until `stop()`."""
+    global _worker
+
+    can, why = available()
+    if not can:
+        _set_state("error", error=why, last_error_at=time.time())
+        return err(why)
+
+    with _lock:
+        if _worker is not None and _worker.is_alive():
+            return ok(state=_state["state"], already=True)
+
+    _stop_flag.clear()
+    while not _audio.empty():
+        try:
+            _audio.get_nowait()
+        except queue.Empty:
+            break
+
+    _worker = threading.Thread(target=_listen_loop, name="jarvish-voice", daemon=True)
+    _worker.start()
+
+    # Report the state the thread reached, not the one we hope for.
+    for _ in range(60):
+        if _state["state"] in ("listening", "error"):
+            break
+        time.sleep(0.05)
+    if _state["state"] == "error":
+        return err(_state["error"] or "Voice failed to start.")
+    return ok(state=_state["state"], device=_state["device"], model=_state["model"])
+
+
+def stop():
+    """Turn the microphone off. Capture ends; nothing further is heard."""
+    global _worker
+
+    _stop_flag.set()
+    worker = _worker
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=5)
+    _worker = None
+    _set_state("off", heard=None, error=None)
+    return ok(state="off")
+
+
+# --------------------------------------------------------------------------
+# Speaking
+# --------------------------------------------------------------------------
+
+_speaker = None
+_speaker_lock = threading.Lock()
+
+
+def _speak_server(text):
+    """Say it through the Windows speech engine, from this process.
+
+    Uses System.Speech, which ships with Windows — no new dependency, and no
+    browser. Runs detached so a long answer never blocks the listen loop, and
+    is killable so "jarvis, stop" actually stops the talking.
+    """
+    global _speaker
+
+    silence_speech()
+    cleaned = _speakable(text)
+    if not cleaned:
+        return False
+
+    script = (
+        "Add-Type -AssemblyName System.Speech;"
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        "$s.Speak([Console]::In.ReadToEnd());"
+    )
+    try:
+        with _speaker_lock:
+            _speaker = subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _speaker.stdin.write(cleaned.encode("utf-8", "replace"))
+            _speaker.stdin.close()
+        return True
+    except Exception as exc:
+        _set_state(None, error="Speech failed: " + str(exc), last_error_at=time.time())
+        return False
+
+
+def silence_speech():
+    """Stop mid-sentence. Called by 'jarvis, stop' and before a new answer."""
+    global _speaker
+    with _speaker_lock:
+        process = _speaker
+        _speaker = None
+    if process and process.poll() is None:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def speaking():
+    """Whether the server is still talking."""
+    with _speaker_lock:
+        return _speaker is not None and _speaker.poll() is None
+
+
+def _speakable(text):
+    """Strip anything that should never be read out loud."""
+    if not text:
+        return ""
+    cleaned = str(text)
+    if cleaned.strip().startswith("{") or cleaned.strip().startswith("["):
+        return ""                     # raw JSON is never spoken
+    for junk in ("**", "*", "`", "#", "|"):
+        cleaned = cleaned.replace(junk, " ")
+    return " ".join(cleaned.split())[:600]
+
+
+def speaking_finished():
+    """The HUD reports it has finished reading the answer out."""
+    if _state["state"] == "speaking":
+        _set_state("listening")
+    return ok(state=_state["state"])
+
+
+# --------------------------------------------------------------------------
+# Tools
+# --------------------------------------------------------------------------
+
+def voice_status():
+    """Whether the microphone is on, and what was last heard."""
+    return status()
+
+
+def voice_listen(on=True):
+    """Turn the persistent microphone on or off."""
+    return start() if as_bool(on, True) else stop()
+
+
+SCHEMAS = [
+    tool("voice_status",
+         "Whether the persistent microphone is on, what state it is in, and what "
+         "was last heard. Read-only."),
+    tool("voice_listen",
+         "Turn the persistent microphone on or off. It keeps listening while other "
+         "applications are in the foreground until it is turned off.",
+         {"on": boolean("True to start listening, false to stop.")}, ["on"]),
+]
+
+REGISTRY = {"voice_status": voice_status, "voice_listen": voice_listen}

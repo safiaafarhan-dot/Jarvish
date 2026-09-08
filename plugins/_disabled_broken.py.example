@@ -1,0 +1,29 @@
+"""A deliberately broken plugin, kept as an example rather than loaded.
+
+Files starting with `_` are skipped by the loader, so this one never runs. Copy
+it to `broken.py` if you want to watch the isolation work: Jarvish will report
+the failure in `list_capabilities`, keep every other plugin loaded, and carry on
+serving.
+
+Each of the failure modes below is handled without taking the server down:
+
+  * an import that does not exist        -> reported, plugin skipped
+  * no `register(api)` function          -> reported, plugin skipped
+  * an exception during registration     -> reported, partial registrations kept
+  * a duplicate capability id            -> that one rejected, others still load
+  * an unknown permission scope          -> rejected with the valid list
+  * a version requirement this build     -> rejected as incompatible
+    cannot satisfy
+  * a hang during registration           -> abandoned after the timeout
+"""
+
+import this_module_does_not_exist  # noqa: F401  <- import failure
+
+
+def register(api):
+    api.tool(
+        name="never_reached",
+        description="This is never registered, because the import above fails.",
+        handler=lambda: {"ok": True},
+        risk_level="safe",
+    )

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>JARVISH</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='none' stroke='%2322d3ee' stroke-width='2'/><circle cx='16' cy='16' r='4' fill='%2322d3ee'/></svg>">
+</head>
+<body data-state="idle">
+
+<!-- ambient background layers -->
+<canvas id="field" class="field" aria-hidden="true"></canvas>
+<div class="vignette" aria-hidden="true"></div>
+<div class="scanline" aria-hidden="true"></div>
+
+<div class="hud" id="hud">
+
+  <!-- ═══════════════════════ top bar ═══════════════════════ -->
+  <header class="bar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-text">JARVISH</span>
+      <span class="brand-sub" id="brand-sub">local intelligence</span>
+    </div>
+
+    <div class="links" id="links">
+      <span class="link" id="link-ollama" data-status="connecting">
+        <i></i><b>OLLAMA</b><em id="link-model">…</em>
+      </span>
+      <span class="link" id="link-net" data-status="connecting">
+        <i></i><b>NET</b><em id="link-net-state">…</em>
+      </span>
+      <span class="link" id="link-voice" data-status="off">
+        <i></i><b>VOICE</b><em id="link-voice-state">idle</em>
+      </span>
+      <span class="link" id="link-tools" data-status="ok">
+        <i></i><b>TOOLS</b><em id="link-tool-count">—</em>
+      </span>
+      <span class="link" id="link-vision" data-status="off" title="Screen vision">
+        <i></i><b>VISION</b><em id="link-vision-state">…</em>
+      </span>
+      <span class="link" id="link-browser" data-status="off" title="Browser control">
+        <i></i><b>BROWSER</b><em id="link-browser-state">…</em>
+      </span>
+      <span class="link" id="link-kb" data-status="off" title="Knowledge index">
+        <i></i><b>KNOWLEDGE</b><em id="link-kb-state">…</em>
+      </span>
+      <span class="link" id="link-watch" data-status="off" title="Proactive monitoring">
+        <i></i><b>WATCH</b><em id="link-watch-state">…</em>
+      </span>
+      <span class="link" id="link-mission" data-status="off" title="Missions">
+        <i></i><b>MISSION</b><em id="link-mission-state">…</em>
+      </span>
+      <span class="link" id="link-plugins" data-status="off" title="Capability registry">
+        <i></i><b>PLUGINS</b><em id="link-plugins-state">…</em>
+      </span>
+      <span class="link" id="link-autonomy" data-status="off" title="Autonomy ceiling">
+        <i></i><b>AUTONOMY</b><em id="link-autonomy-state">…</em>
+      </span>
+    </div>
+
+    <div class="bar-actions">
+      <button class="ghost-btn" id="mute-btn" title="Mute spoken replies" aria-pressed="false">
+        <span id="mute-icon">◉</span> VOICE OUT
+      </button>
+      <button class="ghost-btn" id="reset-btn" title="New session">↺ NEW</button>
+      <button class="stop-btn" id="stop-btn" title="Halt everything — Esc">
+        <span class="stop-dot"></span> STOP
+      </button>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════ left rail ═══════════════════════ -->
+  <aside class="rail left" id="rail-left">
+
+    <section class="panel" id="panel-vitals">
+      <h2>SYSTEM</h2>
+      <div class="gauges" id="gauges">
+        <div class="gauge" data-metric="cpu">
+          <svg viewBox="0 0 68 68" aria-hidden="true">
+            <circle class="track" cx="34" cy="34" r="28"></circle>
+            <circle class="arc" cx="34" cy="34" r="28"></circle>
+          </svg>
+          <span class="gauge-val">0</span>
+          <span class="gauge-key">CPU</span>
+        </div>
+        <div class="gauge" data-metric="memory">
+          <svg viewBox="0 0 68 68" aria-hidden="true">
+            <circle class="track" cx="34" cy="34" r="28"></circle>
+            <circle class="arc" cx="34" cy="34" r="28"></circle>
+          </svg>
+          <span class="gauge-val">0</span>
+          <span class="gauge-key">RAM</span>
+        </div>
+        <div class="gauge" data-metric="disk">
+          <svg viewBox="0 0 68 68" aria-hidden="true">
+            <circle class="track" cx="34" cy="34" r="28"></circle>
+            <circle class="arc" cx="34" cy="34" r="28"></circle>
+          </svg>
+          <span class="gauge-val">0</span>
+          <span class="gauge-key">DISK</span>
+        </div>
+      </div>
+
+      <div class="readouts" id="readouts">
+        <div class="readout"><b>MEM</b><span id="r-mem">—</span></div>
+        <div class="readout"><b>FREE</b><span id="r-disk">—</span></div>
+        <div class="readout"><b>PROC</b><span id="r-proc">—</span></div>
+        <div class="readout"><b>PWR</b><span id="r-batt">—</span></div>
+      </div>
+
+      <canvas id="netgraph" class="netgraph" height="54" aria-hidden="true"></canvas>
+      <div class="net-legend">
+        <span class="down">▼ <b id="r-down">0</b></span>
+        <span class="up">▲ <b id="r-up">0</b></span>
+        <span class="up-time" id="r-uptime">—</span>
+      </div>
+
+      <div class="insights" id="insights" hidden></div>
+    </section>
+
+    <section class="panel grow" id="panel-processes">
+      <h2>TOP PROCESSES</h2>
+      <div class="proc-list" id="proc-list"><p class="dim">sampling…</p></div>
+    </section>
+  </aside>
+
+  <!-- ═══════════════════════ centre ═══════════════════════ -->
+  <main class="core-column" id="core-column">
+
+    <div class="core-stage" id="core-stage">
+      <canvas id="humanoid" class="humanoid" aria-hidden="true"></canvas>
+      <canvas id="core" class="core" aria-hidden="true"></canvas>
+      <div class="core-caption">
+        <span class="core-state" id="core-state">STANDBY</span>
+        <span class="core-detail" id="core-detail">say “jarvis”, or type below</span>
+      </div>
+    </div>
+
+    <div class="transcript" id="transcript" aria-live="polite"></div>
+
+    <div class="pipeline" id="pipeline" hidden>
+      <div class="pipeline-track" id="pipeline-track"></div>
+    </div>
+
+    <footer class="console">
+      <div class="console-state" id="console-state">
+        <span class="cs-dot"></span><span id="cs-text">ready</span>
+      </div>
+      <div class="console-input">
+        <textarea id="input" rows="1" spellcheck="false" autocomplete="off"
+                  placeholder="Speak, or type a command…"></textarea>
+        <button id="mic-btn" class="mic" title="Voice — Ctrl+M" aria-label="Voice input">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="12" rx="3"/>
+            <path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/>
+          </svg>
+        </button>
+        <button id="wake-btn" class="wake" title="Ambient wake-word listening"
+                aria-pressed="false">WAKE</button>
+        <button id="send-btn" class="send" title="Send" aria-label="Send">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="20" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+          </svg>
+        </button>
+      </div>
+      <div class="console-hint" id="console-hint">
+        <kbd>Enter</kbd> send · <kbd>Ctrl</kbd>+<kbd>M</kbd> talk ·
+        <kbd>Ctrl</kbd>+<kbd>K</kbd> wake mode · <kbd>Esc</kbd> stop
+      </div>
+    </footer>
+  </main>
+
+  <!-- ═══════════════════════ right rail ═══════════════════════ -->
+  <aside class="rail right" id="rail-right">
+
+    <section class="panel grow" id="panel-activity">
+      <h2>ACTIVITY <span class="h2-sub" id="activity-count"></span></h2>
+      <div class="stream" id="stream"><p class="dim">no activity yet</p></div>
+    </section>
+
+    <section class="panel mission-panel" id="panel-mission" hidden>
+      <h2>MISSION <span class="h2-sub" id="mission-state"></span></h2>
+      <div class="mission-goal" id="mission-goal"></div>
+      <div class="mission-bar"><i id="mission-fill"></i></div>
+      <div class="mission-progress" id="mission-progress"></div>
+      <div class="mission-tasks" id="mission-tasks"></div>
+      <div class="mission-current" id="mission-current" hidden></div>
+      <div class="mission-actions" id="mission-actions"></div>
+    </section>
+
+    <section class="panel caps-panel" id="panel-caps" hidden>
+      <h2>CAPABILITIES <span class="h2-sub" id="caps-count"></span>
+        <button class="mini-btn" id="reload-plugins" title="Reload plugins">↻</button>
+      </h2>
+      <div class="caps" id="caps"></div>
+      <div class="caps-note" id="caps-note" hidden></div>
+    </section>
+
+    <section class="panel dev-panel" id="panel-dev" hidden>
+      <h2>DEVELOPER <span class="h2-sub" id="dev-stage"></span></h2>
+      <div class="dev-rows" id="dev-rows"></div>
+      <div class="dev-evidence" id="dev-evidence" hidden></div>
+    </section>
+
+    <section class="panel alerts-panel" id="panel-alerts" hidden>
+      <h2>ALERTS <span class="h2-sub" id="alert-count"></span>
+        <button class="mini-btn" id="quiet-btn" title="Quiet mode">◑</button>
+        <button class="mini-btn" id="dismiss-alerts" title="Dismiss all">✕</button>
+      </h2>
+      <div class="alerts" id="alerts"></div>
+    </section>
+
+    <section class="panel tasks-panel" id="panel-tasks" hidden>
+      <h2>TASKS <span class="h2-sub" id="task-count"></span></h2>
+      <div class="tasks" id="tasks"></div>
+    </section>
+
+    <section class="panel kb-panel" id="panel-knowledge" hidden>
+      <h2>KNOWLEDGE <span class="h2-sub" id="kb-method"></span></h2>
+      <div class="sources" id="kb-sources"></div>
+      <div class="kb-note" id="kb-note" hidden></div>
+    </section>
+
+    <section class="panel vision-panel" id="panel-vision" hidden>
+      <h2>VISION <span class="h2-sub" id="vision-mode"></span></h2>
+      <div class="vision-frame" id="vision-frame">
+        <img id="vision-shot" alt="Screen capture">
+        <div class="boxes" id="vision-boxes"></div>
+      </div>
+      <div class="vision-meta" id="vision-meta"></div>
+      <div class="vision-note" id="vision-note" hidden></div>
+    </section>
+
+    <section class="panel autonomy-panel" id="panel-autonomy">
+      <h2>AUTONOMY <span class="h2-sub" id="autonomy-name"></span></h2>
+      <div class="autonomy-levels" id="autonomy-levels"></div>
+      <p class="autonomy-note" id="autonomy-note"></p>
+    </section>
+
+    <section class="panel" id="panel-memory">
+      <h2>MEMORY <button class="mini-btn" id="refresh-memory" title="Refresh">↻</button></h2>
+      <div class="memory" id="memory"><p class="dim">nothing stored</p></div>
+      <div class="rules" id="rules"></div>
+    </section>
+  </aside>
+</div>
+
+<!-- ═══════════════════════ confirmation gate ═══════════════════════ -->
+<div class="gate" id="gate" hidden>
+  <div class="gate-card" role="alertdialog" aria-modal="true" aria-labelledby="gate-title">
+    <div class="gate-badge" id="gate-badge">HIGH RISK</div>
+    <h3 id="gate-title">Confirm this action</h3>
+    <p class="gate-reason" id="gate-reason"></p>
+    <div class="gate-preview" id="gate-preview"></div>
+    <div class="gate-meta" id="gate-meta"></div>
+    <div class="gate-ceiling" id="gate-ceiling" hidden></div>
+    <div class="gate-actions">
+      <button class="gate-deny" id="gate-deny">Decline</button>
+      <button class="gate-allow" id="gate-allow">Authorise</button>
+    </div>
+    <p class="gate-tip">Nothing runs until you choose. <kbd>Esc</kbd> declines.</p>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/static/humanoid.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

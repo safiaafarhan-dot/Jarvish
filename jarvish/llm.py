@@ -1,0 +1,712 @@
+"""Ollama client and the agent loop that lets the model use local tools."""
+
+import asyncio
+import json
+import re
+import time
+import uuid
+
+import httpx
+
+from . import (capabilities, cognition, errors, models, observability, risk,
+               session as sessions, telemetry, tools)
+from .config import (AGENT_TIMEOUT, KEEP_ALIVE, MAX_TOOL_CALLS,
+                     MAX_TOOL_ROUNDS, MODEL, NUM_CTX, NUM_GPU, OLLAMA_HOST,
+                     REQUEST_TIMEOUT, TOOL_TIMEOUT, build_system_prompt)
+
+
+def _options(temperature=0.7):
+    """Generation options: how much of the model to keep on the GPU, and how
+    much context to give it.
+
+    Every layer that lives in VRAM is a layer not competing with the browser for
+    system memory, which on a 16 GB machine is the difference between answering
+    and swapping.
+
+    `num_ctx` is here rather than left to Ollama's default because the default
+    is too small for a turn that carries tool schemas and a tool result, and
+    Ollama drops the overflow without saying anything. It must also be identical
+    on every call: a differing num_ctx forces a full model reload.
+    """
+    options = {"temperature": temperature}
+    try:
+        layers = int(NUM_GPU)
+    except (TypeError, ValueError):
+        layers = 0
+    if layers > 0:
+        options["num_gpu"] = layers
+    if NUM_CTX > 0:
+        options["num_ctx"] = NUM_CTX
+    return options
+
+
+class OllamaUnavailable(RuntimeError):
+    """Raised when the Ollama server cannot be reached."""
+
+
+class ThinkFilter:
+    """Strips <think>...</think> reasoning out of a token stream.
+
+    Reasoning models such as qwen3 emit their scratchpad inline. Ollama is asked
+    to disable it, but older builds ignore that flag, so the tags are filtered
+    here as well. Tags can be split across chunks, hence the small buffer.
+    """
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self):
+        self._buffer = ""
+        self._thinking = False
+
+    def feed(self, chunk):
+        self._buffer += chunk
+        out = []
+
+        while self._buffer:
+            if self._thinking:
+                end = self._buffer.find(self.CLOSE)
+                if end == -1:
+                    # Keep just enough to catch a tag split across chunks.
+                    self._buffer = self._buffer[-len(self.CLOSE):]
+                    break
+                self._buffer = self._buffer[end + len(self.CLOSE):]
+                self._thinking = False
+                continue
+
+            start = self._buffer.find(self.OPEN)
+            if start == -1:
+                # Hold back a possible partial opening tag at the tail.
+                safe = len(self._buffer) - (len(self.OPEN) - 1)
+                if safe > 0:
+                    out.append(self._buffer[:safe])
+                    self._buffer = self._buffer[safe:]
+                break
+
+            out.append(self._buffer[:start])
+            self._buffer = self._buffer[start + len(self.OPEN):]
+            self._thinking = True
+
+        return "".join(out)
+
+    def flush(self):
+        """Whatever is left once the stream ends."""
+        if self._thinking:
+            self._buffer = ""
+            return ""
+        remainder, self._buffer = self._buffer, ""
+        return remainder
+
+
+# Model families that emit a reasoning scratchpad and accept Ollama's `think` flag.
+REASONING_FAMILIES = ("qwen3", "deepseek-r1", "magistral", "gpt-oss", "phi4-reasoning", "exaone-deep")
+
+
+def _is_reasoning_model(name):
+    lowered = str(name).lower()
+    return any(family in lowered for family in REASONING_FAMILIES)
+
+
+async def health():
+    """Report whether Ollama is up and which models it has pulled."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(OLLAMA_HOST + "/api/tags")
+            response.raise_for_status()
+            names = [m.get("name", "") for m in response.json().get("models", [])]
+    except Exception as exc:
+        return {
+            "online": False,
+            "model": MODEL,
+            "models": [],
+            "host": OLLAMA_HOST,
+            "error": str(exc),
+        }
+
+    # Ollama tags carry a :tag suffix; match either the bare name or the full one.
+    installed = any(name == MODEL or name.split(":")[0] == MODEL.split(":")[0] for name in names)
+    return {
+        "online": True,
+        "model": MODEL,
+        "models": names,
+        "host": OLLAMA_HOST,
+        "model_installed": installed,
+    }
+
+
+async def _stream_once(client, messages, use_tools, model=MODEL, schemas=None):
+    """One /api/chat turn. Yields text deltas, then returns the assembled message.
+
+    Ollama emits newline-delimited JSON. Content arrives incrementally; tool
+    calls arrive whole, usually on the final chunk of the turn.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": _options(),
+        # Stay loaded between turns. Without this the model is evicted a few
+        # minutes after the last reply, and the next thing the user says pays a
+        # full reload before a single token appears.
+        "keep_alive": KEEP_ALIVE,
+    }
+    if _is_reasoning_model(model):
+        # Keep the scratchpad out of the spoken reply. Sending this to a model
+        # that has no thinking mode makes Ollama reject the whole request.
+        payload["think"] = False
+    if use_tools:
+        payload["tools"] = schemas if schemas is not None else tools.SCHEMAS
+
+    content_parts = []
+    tool_calls = []
+    think = ThinkFilter()
+
+    try:
+        async with client.stream("POST", OLLAMA_HOST + "/api/chat", json=payload) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode("utf-8", "replace")
+                raise OllamaUnavailable(
+                    "Ollama returned " + str(response.status_code) + ": " + body[:300]
+                )
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("error"):
+                    raise OllamaUnavailable(str(chunk["error"]))
+
+                message = chunk.get("message") or {}
+                delta = think.feed(message.get("content") or "")
+                if delta:
+                    content_parts.append(delta)
+                    yield {"type": "token", "text": delta}
+                for tool_call in message.get("tool_calls") or []:
+                    tool_calls.append(tool_call)
+                if chunk.get("done"):
+                    break
+    except httpx.HTTPError as exc:
+        raise OllamaUnavailable(
+            "Could not reach Ollama at " + OLLAMA_HOST + " (" + str(exc) + ")"
+        ) from exc
+
+    tail = think.flush()
+    if tail:
+        content_parts.append(tail)
+        yield {"type": "token", "text": tail}
+
+    yield {
+        "type": "_turn",
+        "message": {
+            "role": "assistant",
+            "content": "".join(content_parts),
+            "tool_calls": tool_calls,
+        },
+    }
+
+
+def _parse_arguments(raw):
+    """Ollama normally gives a dict, but some models emit a JSON string."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+# --------------------------------------------------------------------------
+# The agent
+# --------------------------------------------------------------------------
+
+# Errors that usually clear on their own, so one retry is worth the second.
+_TRANSIENT = re.compile(
+    r"timed out|timeout|temporarily|connection|refused|unreachable|"
+    r"network is|reset by peer|try again",
+    re.IGNORECASE,
+)
+
+
+def _batch(calls):
+    """Group a turn's tool calls into execution batches.
+
+    Consecutive read-only tools have no side effects and cannot interfere with
+    each other, so they share a batch and run concurrently. Anything that
+    touches the machine gets a batch of its own and runs in the order the model
+    asked for, because a later call may depend on an earlier one.
+    """
+    batches, parallel = [], []
+    for call in calls:
+        name = (call.get("function") or {}).get("name", "")
+        if risk.level(name) == risk.SAFE:
+            parallel.append(call)
+            continue
+        if parallel:
+            batches.append(parallel)
+            parallel = []
+        batches.append([call])
+    if parallel:
+        batches.append(parallel)
+    return batches
+
+
+async def _await_confirmation(session, request_id, timeout=180.0):
+    """Block until the user answers a confirmation, stops, or the wait expires.
+
+    Returns True (approved), False (declined or stopped) or None (timed out).
+    """
+    pending = session.request_approval(request_id)
+    cancel = session.cancel  # captured, because `rearm` swaps the event out
+
+    answered = asyncio.ensure_future(pending["event"].wait())
+    stopped = asyncio.ensure_future(cancel.wait())
+    try:
+        done, _waiting = await asyncio.wait(
+            {answered, stopped}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for task in (answered, stopped):
+            if not task.done():
+                task.cancel()
+        session.drop_approval(request_id)
+
+    if not done:
+        return None
+    if answered not in done:
+        return False
+    return bool(pending["approved"])
+
+
+async def _run_tool(name, arguments, timeout=None):
+    """Execute one tool off the event loop, retrying once on a transient fault.
+
+    Yields recovery notices, then finishes with a ("_result", result) tuple so
+    the caller learns both the outcome and what happened on the way there.
+
+    Two things decide whether the second attempt happens. The older one reads
+    the message for the shape of a transient fault. The newer one asks
+    `errors.is_retryable`, because a categorised failure already knows: an MCP
+    server that timed out is worth one more try, and INVALID_ARGUMENTS or
+    SECURITY_BLOCKED never is - retrying those burns a round of the budget to
+    arrive at the identical answer.
+    """
+    limit = TOOL_TIMEOUT if timeout is None else timeout
+    attempts = 0
+    result = None
+    while attempts < 2:
+        attempts += 1
+        call = asyncio.to_thread(tools.call, name, arguments)
+        if limit and limit > 0:
+            try:
+                result = await asyncio.wait_for(call, timeout=limit)
+            except (asyncio.TimeoutError, TimeoutError):
+                # `to_thread` cannot be interrupted, so the worker may still be
+                # running. What this guarantees is that the *turn* stops waiting
+                # on it - a wedged tool delays one call, not the conversation.
+                result = errors.fail(
+                    errors.TIMEOUT,
+                    name + " did not finish within " + str(round(limit)) + "s.")
+        else:
+            result = await call
+
+        failed = isinstance(result, dict) and result.get("ok") is False
+        if not failed:
+            break
+
+        message = str(result.get("error", ""))
+        category = errors.category_of(result)
+        worth_retrying = (errors.is_retryable(result) if category
+                          else bool(_TRANSIENT.search(message)))
+        if attempts >= 2 or not worth_retrying:
+            break
+        yield {"type": "recovery", "name": name, "message": message,
+               "attempt": attempts, "category": category}
+        await asyncio.sleep(0.6)
+    yield ("_result", result)
+
+
+async def _gather(prepared):
+    """Run a batch of prepared calls, concurrently when there is more than one."""
+
+    async def one(call_id, name, arguments):
+        started = time.perf_counter()
+        notices, result = [], None
+        async for event in _run_tool(name, arguments):
+            if isinstance(event, tuple):
+                result = event[1]
+            else:
+                notices.append(event)
+        elapsed = round((time.perf_counter() - started) * 1000)
+        return call_id, name, arguments, result, elapsed, notices
+
+    if len(prepared) == 1:
+        return [await one(*prepared[0])]
+    return list(await asyncio.gather(*(one(*item) for item in prepared)))
+
+
+# Phrases that mean the user actually wants the long version. Anything else gets
+# the summary, because the reply is spoken aloud and a recital of twenty fields
+# takes eight seconds to hear out.
+_DETAIL_WANTED = (
+    "detail", "detailed", "explain", "why", "walk me through", "in full",
+    "everything", "breakdown", "break it down", "elaborate", "step by step",
+    "what does that mean", "tell me more", "verbose", "full report",
+)
+
+_BREVITY_NOTE = (
+    "Answer from the tool results above in one or two plain spoken sentences. "
+    "Give the values that were asked for, several to a sentence, and leave out "
+    "the rest. No markdown, no bullet list, no field-per-line. Do not restate "
+    "the question or comment on what the numbers mean."
+)
+
+
+def _wants_detail(text):
+    lowered = str(text or "").lower()
+    return any(phrase in lowered for phrase in _DETAIL_WANTED)
+
+
+async def run_agent(history, session=None):
+    """Drive a conversation to completion, executing tool calls along the way.
+
+    Beyond streaming the reply, this reports what the agent is *doing* —
+    analysing, planning, executing, recovering, verifying — so the interface can
+    show the machine working rather than just a spinner. Tools at or above the
+    risk gate stop and wait for the user to approve them, and the session's
+    cancel flag is checked between every step so STOP halts a chain mid-flight.
+
+    Yields event dicts: state, token, plan, tool_start, tool_end, confirm,
+    recovery, insight, error, done.
+    """
+    session = session or sessions.get()
+    session.rearm()
+
+    # One id for the whole turn, so every event below - and every MCP call
+    # underneath them - can be tied back to the request that caused it.
+    request_id = uuid.uuid4().hex[:12]
+    deadline = (time.monotonic() + AGENT_TIMEOUT) if AGENT_TIMEOUT > 0 else None
+
+    system = build_system_prompt()
+    continuity = session.continuity_block()
+    if continuity:
+        system += "\n" + continuity + "\n"
+
+    messages = [{"role": "system", "content": system}] + list(history)
+    graph = []      # every step taken this turn, for the visual tool graph
+    executed = 0
+
+    # Pick the model for this turn from what Ollama actually has pulled. The
+    # agent loop needs tool support, so `route_agent` never returns a model
+    # without it; if none exists the route comes back degraded and says so.
+    latest = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+    brevity_wanted = not _wants_detail(latest)
+    task = models.classify(latest)
+    route = await models.route_agent(task)
+    model = route.model or MODEL
+
+    # A local model chooses badly from 80 schemas — measurably so — so only the
+    # capabilities relevant to this request are offered. Tools already used this
+    # session stay in the list, which is what keeps "do that again" working.
+    used = [entry["name"] for entry in session.tool_history]
+    schemas, offered = capabilities.select(
+        latest, recent=used,
+        groups=getattr(session, "capability_groups", None))
+
+    def state(name, label):
+        session.state = name
+        session.log("state", label)
+        return {"type": "state", "state": name, "label": label}
+
+    def halted():
+        session.state = "stopped"
+        observability.emit(observability.AGENT_FINISHED, session=session.id,
+                           request=request_id, ok=False, tools=executed,
+                           outcome="stopped")
+        return {"type": "done", "content": "", "stopped": True, "graph": graph}
+
+    def out_of_time():
+        """True once this turn has used its whole wall-clock budget.
+
+        MAX_TOOL_ROUNDS bounds how many times the model may come back for more
+        tools, and MAX_TOOL_CALLS bounds how many it may make. Neither bounds
+        how *long* they take, which is the failure mode a slow external server
+        introduces: six rounds of two calls, each waiting a minute on a server
+        that is thinking about it, is a turn that never visibly ends.
+        """
+        return deadline is not None and time.monotonic() > deadline
+
+    yield {"type": "model", **route.as_dict()}
+    yield {"type": "capabilities", "offered": offered["offered"],
+           "count": offered["count"], "total": offered["total"],
+           "groups": offered["groups"]}
+    session.log("tools", str(offered["count"]) + " of " + str(offered["total"]) +
+                " capabilities offered",
+                ", ".join(offered["groups"]) or "default set")
+    session.log("model", route.model or "unavailable", route.reason)
+    observability.emit(observability.AGENT_STARTED, session=session.id,
+                       request=request_id, model=route.model,
+                       offered=offered["count"], total=offered["total"],
+                       groups=offered["groups"])
+    observability.emit(observability.TOOL_SELECTED, session=session.id,
+                       request=request_id, offered=offered["offered"],
+                       groups=offered["groups"])
+    if route.degraded:
+        yield {"type": "insight", "severity": "warning",
+               "text": route.explanation or route.reason}
+
+    yield state("analyzing", "Analysing request")
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)) as client:
+        for round_index in range(MAX_TOOL_ROUNDS + 1):
+            if session.stopped:
+                yield state("stopped", "Stopped")
+                yield halted()
+                return
+
+            # Three separate budgets, and running out of any one of them means
+            # the same thing: stop asking for tools and answer with what is
+            # already known. Dropping the schemas rather than erroring is what
+            # makes that a graceful ending - the model still gets a turn to say
+            # something useful about what it did manage to do.
+            spent = executed >= MAX_TOOL_CALLS
+            timed_out = out_of_time()
+            use_tools = (round_index < MAX_TOOL_ROUNDS and not spent
+                         and not timed_out)
+            if (spent or timed_out) and round_index:
+                limit_note = ("the tool-call limit of " + str(MAX_TOOL_CALLS)
+                              if spent else
+                              "the time limit for one turn")
+                yield {"type": "insight", "severity": "warning",
+                       "text": "Reached " + limit_note +
+                               ". Answering with what has been gathered."}
+                messages.append({
+                    "role": "system",
+                    "content": ("You have reached " + limit_note + ". Do not "
+                                "request any more tools. Answer now from the "
+                                "results you already have, and say plainly if "
+                                "the task is unfinished."),
+                })
+            turn = None
+
+            try:
+                async for event in _stream_once(client, messages, use_tools, model, schemas):
+                    if event["type"] == "_turn":
+                        turn = event["message"]
+                    else:
+                        yield event
+            except OllamaUnavailable as exc:
+                session.log("error", str(exc))
+                yield state("error", "Model unreachable")
+                yield {"type": "error", "message": str(exc)}
+                return
+
+            if turn is None:
+                yield {"type": "error", "message": "Ollama closed the stream unexpectedly."}
+                return
+
+            calls = turn.get("tool_calls") or []
+
+            if not calls:
+                if executed:
+                    yield state("verifying", "Verifying results")
+                yield state("complete", "Complete")
+                session.log("done", "Response delivered")
+                observability.emit(observability.AGENT_FINISHED,
+                                   session=session.id, request=request_id,
+                                   ok=True, tools=executed, rounds=round_index,
+                                   outcome="answered")
+                yield {"type": "done", "content": turn.get("content", ""), "graph": graph}
+                return
+
+            # The tool calls the model just asked for are, in effect, its plan.
+            steps = [
+                {
+                    "name": (call.get("function") or {}).get("name", ""),
+                    "risk": risk.level((call.get("function") or {}).get("name", "")),
+                    "reversible": risk.reversible((call.get("function") or {}).get("name", "")),
+                }
+                for call in calls
+            ]
+            plural = "s" if len(steps) != 1 else ""
+            yield state("planning", "Planning " + str(len(steps)) + " step" + plural)
+            yield {"type": "plan", "steps": steps, "round": round_index + 1}
+
+            # Keep the assistant turn (with its tool calls) in the transcript.
+            messages.append({
+                "role": "assistant",
+                "content": turn.get("content", ""),
+                "tool_calls": calls,
+            })
+
+            for group in _batch(calls):
+                if session.stopped:
+                    break
+
+                prepared = []
+                for call in group:
+                    function = call.get("function") or {}
+                    name = function.get("name", "")
+                    arguments = _parse_arguments(function.get("arguments"))
+                    call_id = uuid.uuid4().hex[:10]
+
+                    # Risk gate: high and critical tools stop and ask first.
+                    # Two things can stop a call: the risk gate, and the autonomy
+                    # ceiling. The ceiling is only ever *stricter* — it can stop
+                    # something the gate would allow, and can never let through
+                    # something the gate stops. `must_confirm` is the one place
+                    # that combination is decided; asking it here rather than
+                    # re-deriving the condition is what keeps the two in step.
+                    stop_call, gate_reason, blocked_by = cognition.must_confirm(
+                        name, arguments)
+                    if stop_call:
+                        # The tier shown must be the one this call actually
+                        # carries, not the tool's baseline.
+                        tier = risk.effective_level(name, arguments)
+                        session.log("confirm", "Awaiting approval for " + name)
+                        observability.emit(
+                            observability.CONFIRMATION_REQUESTED,
+                            session=session.id, request=request_id, tool=name,
+                            risk=tier, blocked_by=blocked_by,
+                            arguments=arguments)
+                        yield {
+                            "type": "confirm",
+                            "id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                            "risk": tier,
+                            "risk_label": risk.LABELS[tier],
+                            "reversible": risk.reversible(name),
+                            "reason": gate_reason or risk.reason(name, arguments),
+                            "autonomy_blocked": blocked_by == "autonomy",
+                            "escalated": risk.escalated(name, arguments) is not None,
+                            "preview": risk.preview(name, arguments),
+                        }
+                        decision = await _await_confirmation(
+                            session, call_id,
+                            timeout=getattr(session, "approval_wait", None) or 180.0)
+                        observability.emit(
+                            observability.CONFIRMATION_GRANTED if decision is True
+                            else observability.CONFIRMATION_DENIED,
+                            session=session.id, request=request_id, tool=name,
+                            risk=tier,
+                            outcome=("approved" if decision is True
+                                     else "declined" if decision is False
+                                     else "timed out"))
+                        if decision is not True:
+                            refusal = ("The user declined this action."
+                                       if decision is False else
+                                       "The confirmation timed out, so nothing was run.")
+                            graph.append({"id": call_id, "name": name,
+                                          "status": "declined", "risk": tier})
+                            declined_result = errors.fail(
+                                errors.CONFIRMATION_REQUIRED, refusal)
+                            yield {"type": "tool_end", "id": call_id, "name": name,
+                                   "ok": False, "declined": True,
+                                   "result": declined_result}
+                            messages.append({
+                                "role": "tool", "name": name,
+                                "content": json.dumps(declined_result),
+                            })
+                            continue
+
+                    prepared.append((call_id, name, arguments))
+
+                if not prepared:
+                    continue
+
+                concurrent = len(prepared) > 1
+                for call_id, name, arguments in prepared:
+                    tier = risk.level(name)
+                    yield {
+                        "type": "tool_start",
+                        "id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                        "risk": tier,
+                        "risk_label": risk.LABELS[tier],
+                        "reversible": risk.reversible(name),
+                        "parallel": concurrent,
+                    }
+                    session.log("tool", "Executing " + name, risk.preview(name, arguments))
+                    observability.emit(observability.TOOL_STARTED,
+                                       session=session.id, request=request_id,
+                                       tool=name, risk=tier, id=call_id,
+                                       arguments=arguments)
+
+                yield state(
+                    "executing",
+                    "Executing " + str(len(prepared)) + " tools in parallel"
+                    if concurrent else "Executing " + prepared[0][1],
+                )
+
+                results = await _gather(prepared)
+
+                for call_id, name, arguments, result, elapsed, notices in results:
+                    for notice in notices:
+                        yield dict(notice, id=call_id)
+
+                    ok = not (isinstance(result, dict) and result.get("ok") is False)
+                    executed += 1
+                    category = errors.category_of(result)
+                    observability.emit(
+                        observability.TOOL_FINISHED if ok
+                        else observability.TOOL_FAILED,
+                        session=session.id, request=request_id, tool=name,
+                        ms=elapsed, ok=ok, id=call_id,
+                        error_category=category,
+                        retries=len(notices))
+                    graph.append({"id": call_id, "name": name,
+                                  "status": "ok" if ok else "failed",
+                                  "risk": risk.level(name), "ms": elapsed})
+                    session.note_tool(name, arguments,
+                                      result if isinstance(result, dict) else {})
+                    cognition.record_tool(
+                        name, ok, elapsed,
+                        (result or {}).get("error") if isinstance(result, dict) else None)
+                    yield {"type": "tool_end", "id": call_id, "name": name,
+                           "ok": ok, "result": result, "ms": elapsed}
+
+                    messages.append({
+                        "role": "tool",
+                        "name": name,
+                        "content": json.dumps(result, default=str)[:6000],
+                    })
+
+                    # A failed step is worth naming, so the model picks another route.
+                    if not ok:
+                        session.log("error", name + " failed",
+                                    str((result or {}).get("error", "")))
+                        yield state("recovering", "Recovering from " + name)
+
+                # Reading the machine is a chance to notice something about it.
+                if any(row[1] in ("system_info", "list_processes") for row in results):
+                    for note in telemetry.insights()[:1]:
+                        yield {"type": "insight", "text": note["text"],
+                               "severity": note["severity"]}
+
+            if session.stopped:
+                yield state("stopped", "Stopped")
+                yield halted()
+                return
+
+            # Ask for a short answer *here*, after the tools have already run,
+            # rather than in the system prompt. Brevity guidance up there was
+            # measured suppressing the tool call itself — the model read "answer
+            # briefly" as licence to answer from memory, and reported a time it
+            # had invented. Placed after the results it cannot do that: the
+            # lookup has happened, and the only thing left to decide is length.
+            if brevity_wanted:
+                messages.append({"role": "system", "content": _BREVITY_NOTE})
+
+            yield state("analyzing", "Reading results")
+
+        yield state("complete", "Complete")
+        observability.emit(observability.AGENT_FINISHED, session=session.id,
+                           request=request_id, ok=False, tools=executed,
+                           outcome="rounds exhausted")
+        yield {"type": "done", "content": "", "graph": graph}

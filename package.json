@@ -1,0 +1,17 @@
+{
+  "name": "jarvish",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local voice assistant with PC control. Python/FastAPI backend, static web frontend, Ollama for inference. npm is used here only as a task runner - there are no JavaScript dependencies to install.",
+  "scripts": {
+    "dev": "python new.py",
+    "start": "python new.py --no-browser",
+    "check": "python new.py --check",
+    "setup": "python -m pip install -r requirements.txt",
+    "postinstall": "python -m pip install -r requirements.txt",
+    "phone": "python new.py --host 0.0.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

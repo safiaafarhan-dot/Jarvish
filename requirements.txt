@@ -1,0 +1,27 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+psutil>=5.9
+
+# Screen vision: capture, local OCR, UI Automation grounding
+pillow
+uiautomation
+winsdk
+comtypes
+
+# Browser control over the Chrome DevTools Protocol
+websockets
+
+# Knowledge indexing (PDF text extraction; keyword search uses stdlib sqlite FTS5)
+pypdf
+
+# Persistent voice: OS-level microphone capture and local speech-to-text.
+# The microphone belongs to the server process, not a browser tab, so it
+# keeps listening while other applications are in the foreground.
+sounddevice
+faster-whisper
+
+# Model Context Protocol. Optional at runtime: with no mcp.json, Jarvish runs
+# exactly as it did before this was added, and `mcp status` says so. It is
+# listed here because the MCP client, its tests and `--doctor` all need it.
+mcp>=2.2

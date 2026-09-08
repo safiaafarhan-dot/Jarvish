@@ -1,0 +1,123 @@
+# --------------------------------------------------------------------------
+# Python
+# --------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --------------------------------------------------------------------------
+# Secrets
+# --------------------------------------------------------------------------
+# Real environment files never go in. Templates do — they are how somebody
+# learns which variables exist, and they hold names, not values.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+*.pem
+*.key
+id_rsa
+id_ed25519
+credentials.json
+
+# --------------------------------------------------------------------------
+# Jarvish runtime state
+# --------------------------------------------------------------------------
+# Everything under data/ is generated at runtime and none of it is source.
+# Two parts of it are actively unsafe to publish:
+#
+#   browser-profile/  a real Chrome profile — cookies, logins, certificates
+#                     (222 MB of it on this machine)
+#   captures/         screenshots of whatever was on the screen at the time
+#
+# The rest is databases, event logs, edit backups and personal memory, all of
+# which Jarvish rebuilds on its own. The folder itself is created on startup,
+# so nothing here needs to be tracked to make a fresh clone work.
+data/
+
+# Server and launcher logs
+*.log
+logs/
+
+# --------------------------------------------------------------------------
+# Models and caches
+# --------------------------------------------------------------------------
+# Ollama and faster-whisper keep their weights outside the project, so this is
+# a guard against a model ever being dropped in here by hand rather than a
+# description of where they currently live.
+models/
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.ckpt
+.cache/
+
+# --------------------------------------------------------------------------
+# Node
+# --------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+.npm/
+
+# --------------------------------------------------------------------------
+# Editors and IDEs
+# --------------------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.spyproject/
+.ropeproject/
+
+# --------------------------------------------------------------------------
+# Operating system
+# --------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.Spotlight-V100
+.Trashes
+
+# --------------------------------------------------------------------------
+# Temporary files
+# --------------------------------------------------------------------------
+*.tmp
+*.temp
+tmp/
+temp/
+*.pid
+
+# Note: *.bak is deliberately NOT ignored. The .bak files in jarvish/, web/
+# and tests/ are earlier versions of real source kept by hand, and this
+# checkpoint exists to preserve exactly that kind of thing.
