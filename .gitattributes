@@ -1,0 +1,8 @@
+# Line endings are normalised to LF inside the repository, while the working
+# tree keeps whatever the platform uses. Without this, files written with CRLF
+# on Windows compare byte-for-byte against LF blobs and every single line reads
+# as modified — a two-line test edit showed up as a 1,521-line diff.
+#
+# `text=auto` lets Git decide which files are text and leaves anything binary
+# alone, so nothing needs listing by hand.
+* text=auto

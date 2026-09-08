@@ -118,6 +118,20 @@ tmp/
 temp/
 *.pid
 
-# Note: *.bak is deliberately NOT ignored. The .bak files in jarvish/, web/
-# and tests/ are earlier versions of real source kept by hand, and this
-# checkpoint exists to preserve exactly that kind of thing.
+# Hand-kept backups of earlier versions. They are working files, not source,
+# and a public repository is not where they belong. The originals stay on disk
+# untouched — this only stops new ones being added.
+#
+# Seven .bak files are still tracked from the first checkpoint commit. Ignoring
+# a pattern does not untrack what is already in the index, so removing those is
+# a separate, deliberate decision rather than something this line does quietly.
+*.bak
+
+# --------------------------------------------------------------------------
+# Vercel
+# --------------------------------------------------------------------------
+# web/.gitignore already covers web/.vercel/. This covers a .vercel/ created by
+# running the CLI from the repository root, which that file would not catch.
+# It holds the project and org ids — identifiers rather than secrets, but not
+# something a public repository needs.
+.vercel

@@ -1,0 +1,18 @@
+# Anything listed here is not uploaded to Vercel.
+#
+# The deploy root is web/, so nothing outside this folder is ever sent —
+# jarvish/, data/, tests/, mcp.json and requirements.txt are all out of scope
+# by construction. What follows guards the files that *are* in here.
+
+# Hand-kept backups of earlier UI versions. Harmless, but a static host serves
+# every file it is given, so app.js.bak would sit at a public URL with no
+# reason to be there.
+*.bak
+
+# Never, under any circumstances.
+.env
+.env.*
+*.pem
+*.key
+*.db
+*.log

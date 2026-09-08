@@ -192,7 +192,16 @@ ok("apply_change is graded medium", t["tools"]["apply_change"]["risk"] == "mediu
 ok("git reads are safe", t["tools"]["git_status"]["risk"] == "safe")
 
 gs = c.post(BASE + "/api/tool/git_status", json={"path": "."}).json()
-ok("non-repo reported honestly", not gs["ok"] and "not a git repository" in gs["error"])
+# Honest either way. This used to assert the project was *not* a repository,
+# which was true when it was written and stopped being true the moment one was
+# initialised — a test that fails on a change to its surroundings rather than
+# on a change to the code. What actually matters is that git_status never
+# invents an answer: a real repository comes back with a branch and a list of
+# changes, and the absence of one is reported as such.
+ok("git status reported honestly",
+   (gs["ok"] and gs.get("branch") and isinstance(gs.get("changes"), list))
+   or (not gs["ok"] and "not a git repository" in gs.get("error", "")),
+   gs.get("branch") or gs.get("error", "")[:30])
 
 sel = c.get(BASE + "/api/capabilities", params={"q": "why is this test failing"}).json()["selection"]
 ok("dev capability group selected", "dev" in sel["groups"], sel["groups"])

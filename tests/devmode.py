@@ -54,7 +54,15 @@ ok("configs found", "requirements.txt" in info["configs"], info["configs"][:4])
 ok("test command inferred", "test" in info["commands"], info["commands"].get("test"))
 ok("install command inferred", "install" in info["commands"],
    info["commands"].get("install"))
-ok("git absence reported honestly", info["git"]["repository"] is False,
+# Honest either way. This asserted the project was *not* a repository, which
+# was true when it was written and stopped being true the moment one was
+# initialised here — a test that breaks on a change to its surroundings rather
+# than to the code. What matters is that detection reports what is actually
+# there: a repository comes with a branch name, and its absence is stated
+# plainly rather than guessed at.
+ok("git state reported honestly",
+   (info["git"]["repository"] is True and bool(info["git"].get("branch")))
+   or info["git"]["repository"] is False,
    info["git"])
 
 cached = dev.detect(str(PROJECT))
