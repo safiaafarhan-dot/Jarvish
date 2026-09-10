@@ -21,8 +21,9 @@ import psutil
 from .config import ALLOW_SHELL
 from .util import IS_WINDOWS, as_int, err as _err, expand as _expand, ok, tool as _tool
 
-# Friendly name -> what to hand to the shell. Anything not listed is passed
-# through to `start`, which resolves app execution aliases and PATH entries.
+# Friendly name -> what to hand to the shell. This table is also the allowlist:
+# a name that is not in it cannot be launched. Add an entry to permit a new
+# application.
 APP_ALIASES = {
     "notepad": "notepad",
     "calculator": "calc",
@@ -125,15 +126,39 @@ def list_processes(limit=8):
 # Launching things
 # --------------------------------------------------------------------------
 
+# Every launch target this tool will accept. Derived from APP_ALIASES rather
+# than written out again, so adding an alias is the only thing needed to allow
+# a new application and the two can never disagree.
+ALLOWED_APPS = frozenset(APP_ALIASES.values())
+
+
 def open_app(name):
-    """Launch a desktop application by name."""
+    """Launch an allowlisted desktop application by name."""
     key = str(name).strip().lower()
-    target = APP_ALIASES.get(key, key)
-    if not target:
+    if not key:
         return _err("No application name given.")
+
+    # Resolution used to fall back to the caller's own string, which meant the
+    # name was never really checked: `open_app("cmd.exe /c del C:\\Windows")`
+    # resolved to itself and went straight into `cmd /c start`, where the
+    # arguments are a command line, not a filename. The model could reach any
+    # executable with any arguments through a tool graded `low` risk that never
+    # asks for confirmation. Membership of the allowlist is now required.
+    target = APP_ALIASES.get(key)
+    if target is None:
+        if key in ALLOWED_APPS:
+            target = key          # the underlying name, e.g. "msedge"
+        else:
+            return _err(
+                "'" + str(name) + "' is not an application Jarvish may launch. "
+                "Allowed: " + ", ".join(sorted(APP_ALIASES)) + "."
+            )
+
     try:
         if IS_WINDOWS:
-            # `start` handles .exe on PATH, UWP protocol handles and app aliases alike.
+            # `start` handles .exe on PATH, UWP protocol handles and app aliases
+            # alike. `target` is safe to pass here only because it came out of
+            # the table above - never straight from the caller.
             subprocess.Popen(["cmd", "/c", "start", "", target], shell=False)
         elif shutil.which("open"):
             subprocess.Popen(["open", "-a", target])
@@ -144,18 +169,54 @@ def open_app(name):
         return _err("Could not launch " + str(name) + ": " + str(exc))
 
 
+# The only schemes a web address may use. Everything else is refused rather
+# than handed to the browser: `file:` reads local files - including the
+# credential paths the filesystem guard blocks everywhere else - and
+# `javascript:` and `data:` execute in whatever page happens to be focused.
+ALLOWED_URL_SCHEMES = ("http", "https")
+
+_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+
+
 def open_url(url):
-    """Open a web address in the default browser."""
+    """Open an http or https address in the default browser."""
     url = str(url).strip()
     if not url:
         return _err("No URL given.")
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+
+    match = _SCHEME_RE.match(url)
+    if match:
+        scheme = match.group(1).lower()
+        if scheme not in ALLOWED_URL_SCHEMES:
+            return _err(
+                "Only http and https addresses can be opened, not '" +
+                scheme + ":'."
+            )
+        # A scheme on its own is not an address. "http://" passes the check
+        # above and then opens a blank page while reporting success.
+        if not re.match(r"^https?://[A-Za-z0-9]", url, re.I):
+            return _err("'" + url + "' has no host to open.")
+    else:
+        # A bare address like "youtube.com". It has to still look like a host,
+        # or "not-a-url" silently became "https://not-a-url" and reported
+        # success for a page that could never load.
+        if not re.match(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+([/?#].*)?$", url):
+            return _err(
+                "'" + url + "' is not a web address. Give a full http or https "
+                "URL, or a domain such as example.com."
+            )
         url = "https://" + url
+
     try:
-        webbrowser.open(url)
-        return {"ok": True, "opened": url}
+        # `webbrowser.open` reports whether a browser was actually found. The
+        # result used to be discarded, so a failed launch still came back as a
+        # success and the assistant said it had opened something it had not.
+        launched = webbrowser.open(url)
     except Exception as exc:
         return _err("Could not open " + url + ": " + str(exc))
+    if not launched:
+        return _err("No browser could be launched for " + url + ".")
+    return {"ok": True, "opened": url}
 
 
 # --------------------------------------------------------------------------
