@@ -137,27 +137,79 @@ for field in ("wake_word", "model", "model_installed", "tool_count", "shell_enab
     ok("the HUD's " + field + " is present", field in health)
 ok("an autonomy ceiling is absent rather than invented", "autonomy" not in health)
 
-# ── the rewrite in vercel.json ───────────────────────────────────────────
-print("--- routing survives the rewrite that gets requests here ---")
+# ── the entrypoint Vercel resolves ───────────────────────────────────────
+print("--- Vercel can find the FastAPI entrypoint ---")
 
+# `api/index.py` is not one of Vercel's default entrypoint locations (app.py,
+# index.py, server.py, main.py, wsgi.py, asgi.py, optionally under src/ or
+# app/), so detection failed with "No FastAPI entrypoint found in default
+# locations". `tool.vercel.entrypoint` names it explicitly. There is one file
+# per possible build root, so the deployment resolves either way.
+import re
+
+def entrypoint(path):
+    text = read(path)
+    ok("[tool.vercel] is declared in " + os.path.basename(os.path.dirname(path) or "."),
+       "[tool.vercel]" in text)
+    found = re.search(r'entrypoint\s*=\s*"([^"]+)"', text)
+    return found.group(1) if found else None
+
+root_entry = entrypoint(os.path.join(ROOT, "pyproject.toml"))
+web_entry = entrypoint(os.path.join(WEB, "pyproject.toml"))
+
+ok("a root-directory build resolves web/api/index.py",
+   root_entry == "web.api.index:app", root_entry)
+ok("a web-directory build resolves the same file",
+   web_entry == "api.index:app", web_entry)
+ok("both name the FastAPI variable Vercel looks for",
+   root_entry.endswith(":app") and web_entry.endswith(":app"))
+
+# The module path must actually resolve to the file that exists.
+for entry, base in ((root_entry, ROOT), (web_entry, WEB)):
+    module = entry.split(":")[0].replace(".", os.sep) + ".py"
+    ok("'" + entry + "' points at a real file",
+       os.path.isfile(os.path.join(base, module)), module)
+
+ok("the entrypoint is not the desktop backend",
+   "jarvish" not in root_entry and "jarvish" not in web_entry)
+
+# `functions` is keyed by the resolved entrypoint path, not by a URL.
+root_config = json.loads(read(os.path.join(ROOT, "vercel.json")))
 config = json.loads(read(os.path.join(WEB, "vercel.json")))
-rewrites = {rule["source"]: rule["destination"] for rule in config["rewrites"]}
 
-ok("/static is still rewritten for the local /static mount",
-   rewrites.get("/static/:path*") == "/:path*")
-ok("/api is routed to the function", "/api/(.*)" in rewrites)
-ok("the original endpoint is carried through the rewrite",
-   "endpoint=$1" in rewrites.get("/api/(.*)", ""))
+ok("the root build configures the resolved entrypoint",
+   "web/api/index.py" in root_config["functions"])
+ok("the web build configures the resolved entrypoint",
+   "api/index.py" in config["functions"])
 ok("the function is given room to stream a reply",
    config["functions"]["api/index.py"]["maxDuration"] >= 30)
+ok("and so is the root build's",
+   root_config["functions"]["web/api/index.py"]["maxDuration"] >= 30)
 
-# Both forms must route: the path when served directly, the query parameter
-# when Vercel has already replaced the path with the rewrite destination.
-ok("the ?endpoint= form reaches health",
-   client.get("/api/index", params={"endpoint": "health"}).status_code == 200)
-ok("the ?endpoint= form reaches a refusal",
-   client.get("/api/index", params={"endpoint": "tasks"}).status_code == 503)
+print("--- the one function serves the HUD and the API ---")
+
+# A FastAPI app on Vercel is a single function serving every route, so the
+# interface is served by the app rather than as a separate static build.
+response = client.get("/")
+ok("/ serves the HUD", response.status_code == 200, response.status_code)
+# Byte-wise: this file has CRLF line endings, and a text-mode read would
+# translate them and make an identical file look modified.
+ok("it is the existing index.html, byte for byte",
+   response.content == io.open(os.path.join(WEB, "index.html"), "rb").read())
+
+for asset in ("app.js", "style.css", "humanoid.js"):
+    result = client.get("/static/" + asset)
+    ok("/static/" + asset + " is served", result.status_code == 200, result.status_code)
+ok("the HUD's own asset paths resolve unchanged",
+   '/static/app.js' in response.text)
+
+# The mount must not publish the deployment's plumbing alongside the interface.
+for hidden in ("/static/api/index.py", "/static/requirements.txt"):
+    ok(hidden + " is not served", client.get(hidden).status_code == 404)
+
 ok("the plain path reaches health", client.get("/api/health").status_code == 200)
+ok("the ?endpoint= form still reaches health",
+   client.get("/api/index", params={"endpoint": "health"}).status_code == 200)
 
 # ── everything local refuses, and says why ───────────────────────────────
 print("--- local-only endpoints refuse rather than pretend ---")
@@ -352,16 +404,16 @@ ok("the deploy root does not contain package.json",
 ok("the deploy root has its own, Linux-clean requirements",
    os.path.isfile(os.path.join(WEB, "requirements.txt")))
 
-root_config = json.loads(read(os.path.join(ROOT, "vercel.json")))
 ok("a root build overrides the install command",
    "installCommand" in root_config)
-ok("that override cannot reach pip",
-   "pip" not in root_config["installCommand"])
+# The guard is the *target* of the install, not the absence of pip: the
+# function needs fastapi, and this is the only list it may take it from.
+ok("it installs the Linux-clean list",
+   root_config["installCommand"].strip().endswith("web/requirements.txt"))
+ok("it can never reach the desktop requirements",
+   "-r requirements.txt" not in root_config["installCommand"])
 ok("a root build overrides the build command", "buildCommand" in root_config)
-ok("a root build serves web/, not the repository",
-   root_config["outputDirectory"] == "web")
-ok("so a root build cannot publish the desktop agent",
-   root_config["outputDirectory"] != "." and root_config["outputDirectory"] != "")
+ok("nothing is built", "pip" not in root_config["buildCommand"])
 
 # ── the interface was not changed to make any of this work ───────────────
 print("--- the existing interface is untouched ---")

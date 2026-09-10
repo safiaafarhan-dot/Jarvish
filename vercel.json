@@ -1,14 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "echo 'Jarvish: skipping install. The desktop assistant is Windows-only and is not part of this build.'",
-  "buildCommand": "echo 'Jarvish: nothing to build. web/ is a plain static interface.'",
-  "outputDirectory": "web",
-  "rewrites": [
-    {
-      "source": "/static/:path*",
-      "destination": "/:path*"
+  "installCommand": "pip install -r web/requirements.txt",
+  "buildCommand": "echo 'Jarvish: nothing to build. The interface is served by the FastAPI app.'",
+  "functions": {
+    "web/api/index.py": {
+      "maxDuration": 60
     }
-  ],
+  },
   "headers": [
     {
       "source": "/(.*)",

@@ -1,0 +1,23 @@
+# Vercel configuration only. Jarvish is not a packaged Python project — it is
+# run from this directory with `python new.py`, and nothing here changes that.
+#
+# Vercel detects FastAPI from the dependency list and then looks for a FastAPI
+# instance named `app` at one of its supported entrypoints: app.py, index.py,
+# server.py, main.py, wsgi.py or asgi.py, optionally under src/ or app/.
+# `web/api/index.py` is not one of those, so detection failed with:
+#
+#   No FastAPI entrypoint found in default locations, but found potential
+#   entrypoints: web/api/index.py (variable: app)
+#
+# This is the fix Vercel itself prescribes for an app in a custom module. The
+# value is a module path from the build root, so it is correct when the Root
+# Directory is the repository root. `web/pyproject.toml` carries the same
+# setting written from web/, for a project pointed there instead — whichever
+# directory Vercel builds from, it finds an entrypoint.
+#
+# The desktop assistant is deliberately not named here. jarvish/server.py has
+# its own FastAPI instance, and it must never be what Vercel deploys: it opens
+# SQLite databases, starts MCP subprocesses and expects Ollama on this machine.
+
+[tool.vercel]
+entrypoint = "web.api.index:app"

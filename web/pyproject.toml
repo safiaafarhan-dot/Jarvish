@@ -1,0 +1,11 @@
+# The same Vercel entrypoint setting as the repository root's pyproject.toml,
+# written from this directory — for a project whose Root Directory is `web`.
+# Vercel reads whichever pyproject.toml sits at the directory it builds from,
+# so the deployment resolves an entrypoint either way and the web/ boundary is
+# preserved when the Root Directory is set to it.
+#
+# From here the module path drops the leading `web.`: this resolves to
+# ./api/index.py, the same file the root config reaches as web/api/index.py.
+
+[tool.vercel]
+entrypoint = "api.index:app"

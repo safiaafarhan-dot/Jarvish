@@ -33,9 +33,17 @@ function is the function itself.
 import json
 import os
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+# The HUD, one directory up from this file. A FastAPI app on Vercel is a single
+# function that serves every route, so the interface is served from here rather
+# than as a separate static build - the same arrangement jarvish/server.py uses
+# locally, which is why index.html's /static/... references work unchanged.
+WEB_DIR = Path(__file__).resolve().parent.parent
 
 # --------------------------------------------------------------------------
 # Configuration. Every value comes from the environment, and the only one that
@@ -301,9 +309,20 @@ async def _chat(request):
 
 # --------------------------------------------------------------------------
 # Router
+#
+# Declaration order is load-bearing. Vercel gives a route declared before a
+# static mount priority over the files under it, so the API is registered
+# first and the HUD is mounted last - exactly the precedence the local server
+# has, where /api/* is routed and /static/* falls through to disk.
 # --------------------------------------------------------------------------
 
-@app.api_route("/{_path:path}", methods=["GET", "POST", "OPTIONS"])
+@app.get("/")
+async def index():
+    """The HUD itself, unchanged from the file the local server serves."""
+    return FileResponse(WEB_DIR / "index.html")
+
+
+@app.api_route("/api/{_path:path}", methods=["GET", "POST", "OPTIONS"])
 async def route(request: Request, _path: str = ""):
     endpoint = _endpoint(request)
 
@@ -323,3 +342,20 @@ async def route(request: Request, _path: str = ""):
         "error": "Not available in this deployment - " + _reason(endpoint) + ".",
         "hint": "Run Jarvish on your own machine for this: python new.py",
     }, status_code=503), request)
+
+
+# Mounted last, so every route above wins over a file of the same name. Vercel
+# promotes these to the CDN at build time; the HUD asks for /static/app.js and
+# gets web/app.js, which is why no interface file needed changing. The two
+# files here that belong to the build rather than the interface - this module
+# and requirements.txt - are excluded, matching the local server's guard.
+class _BuildFilesHidden(StaticFiles):
+    """The HUD's own assets, without the deployment's plumbing."""
+
+    async def get_response(self, path, scope):
+        if path.replace("\\", "/").lstrip("/").startswith(("api/", "requirements.txt")):
+            return await super().get_response("__missing__", scope)
+        return await super().get_response(path, scope)
+
+
+app.mount("/static", _BuildFilesHidden(directory=WEB_DIR), name="static")
