@@ -22,7 +22,9 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
+import types
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -471,6 +473,225 @@ ok("the HUD still asks for /api/health", 'fetch("/api/health"' in app_js)
 ok("the HUD still streams chat from /api/chat", 'fetch("/api/chat"' in app_js)
 ok("index.html still loads assets through /static",
    '/static/app.js' in read(os.path.join(WEB, "index.html")))
+
+# ── cloud replies, against a mocked SDK ──────────────────────────────────
+# Everything above runs with no key, which is the deployment's default state.
+# These exercise the branch that only runs once a key is set. The Anthropic
+# SDK is replaced with a stand-in, so no key is needed, no network call is
+# made and nothing is billed - and the assertions are still about the real
+# code path, because only the SDK is substituted.
+print("--- cloud replies (mocked SDK - no key, no network, no cost) ---")
+
+CAPTURED = {}
+
+
+class _FakeStream:
+    """Stands in for the async context manager client.beta.messages.stream returns."""
+
+    def __init__(self, chunks, final, fail=None):
+        self._chunks, self._final, self._fail = chunks, final, fail
+
+    async def __aenter__(self):
+        if self._fail:
+            raise self._fail
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    @property
+    def text_stream(self):
+        async def chunks():
+            for chunk in self._chunks:
+                yield chunk
+        return chunks()
+
+    async def get_final_message(self):
+        return self._final
+
+
+class _Final:
+    def __init__(self, stop_reason="end_turn"):
+        self.stop_reason = stop_reason
+
+
+def fake_anthropic(chunks=("Understood. ", "On it."), stop_reason="end_turn",
+                   fail=None, construct_error=None):
+    """A module object with the one name web/api/index.py imports."""
+    module = types.ModuleType("anthropic")
+
+    class _Messages:
+        def stream(self, **kwargs):
+            CAPTURED.clear()
+            CAPTURED.update(kwargs)
+            return _FakeStream(chunks, _Final(stop_reason), fail)
+
+    class _Beta:
+        messages = _Messages()
+
+    class AsyncAnthropic:
+        def __init__(self, *args, **kwargs):
+            if construct_error:
+                raise construct_error
+            self.beta = _Beta()
+
+    module.AsyncAnthropic = AsyncAnthropic
+    return module
+
+
+def cloud_chat(body, module=None, environment=None):
+    """POST /api/chat with a key present and the SDK swapped out."""
+    previous = sys.modules.get("anthropic")
+    saved = {k: os.environ.get(k) for k in
+             ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "JARVISH_CLOUD_MODEL")}
+    os.environ["ANTHROPIC_API_KEY"] = PROBE
+    for key, value in (environment or {}).items():
+        os.environ[key] = value
+    sys.modules["anthropic"] = module if module is not None else fake_anthropic()
+    try:
+        return TestClient(load_cloud().app).post("/api/chat", json=body)
+    finally:
+        if previous is None:
+            sys.modules.pop("anthropic", None)
+        else:
+            sys.modules["anthropic"] = previous
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def frames(response):
+    out = []
+    for frame in response.text.split("\n\n"):
+        frame = frame.strip()
+        if frame.startswith("data:"):
+            out.append(json.loads(frame[5:].strip()))
+    return out
+
+
+# ── a successful reply ───────────────────────────────────────────────────
+reply = cloud_chat({"messages": [{"role": "user", "content": "status?"}]})
+events = frames(reply)
+kinds = [event["type"] for event in events]
+
+ok("a configured deployment answers 200", reply.status_code == 200, reply.status_code)
+ok("it streams server-sent events",
+   reply.headers["content-type"].startswith("text/event-stream"))
+ok("the session id comes first", kinds[0] == "session", kinds[:1])
+ok("the stream closes with done", kinds[-1] == "done", kinds[-1:])
+ok("no error frame on the happy path", "error" not in kinds, kinds)
+
+spoken = "".join(e["text"] for e in events if e["type"] == "token")
+ok("the model's words reach the client", spoken == "Understood. On it.", spoken)
+ok("the unconfigured notice is gone", "No cloud model is configured" not in spoken)
+
+# The request the SDK actually received.
+ok("the model is sent", CAPTURED.get("model") == "claude-opus-5", CAPTURED.get("model"))
+ok("a reply ceiling is sent", isinstance(CAPTURED.get("max_tokens"), int))
+ok("a system prompt is sent", bool(CAPTURED.get("system")))
+ok("the system prompt says there are no tools",
+   "no tools" in str(CAPTURED.get("system")).lower())
+ok("the user's message is forwarded",
+   CAPTURED.get("messages") == [{"role": "user", "content": "status?"}],
+   CAPTURED.get("messages"))
+ok("the key is never passed in the request body",
+   PROBE not in json.dumps(CAPTURED, default=str))
+
+# ── the model is configurable ────────────────────────────────────────────
+cloud_chat({"messages": [{"role": "user", "content": "hi"}]},
+           environment={"ANTHROPIC_MODEL": "claude-haiku-4-5"})
+ok("ANTHROPIC_MODEL selects the model",
+   CAPTURED.get("model") == "claude-haiku-4-5", CAPTURED.get("model"))
+
+cloud_chat({"messages": [{"role": "user", "content": "hi"}]},
+           environment={"JARVISH_CLOUD_MODEL": "claude-sonnet-5"})
+ok("the older variable still works",
+   CAPTURED.get("model") == "claude-sonnet-5", CAPTURED.get("model"))
+
+cloud_chat({"messages": [{"role": "user", "content": "hi"}]},
+           environment={"ANTHROPIC_MODEL": "claude-haiku-4-5",
+                        "JARVISH_CLOUD_MODEL": "claude-sonnet-5"})
+ok("ANTHROPIC_MODEL wins when both are set",
+   CAPTURED.get("model") == "claude-haiku-4-5", CAPTURED.get("model"))
+
+# ── a refusal is reported, not swallowed ─────────────────────────────────
+refused = frames(cloud_chat({"messages": [{"role": "user", "content": "x"}]},
+                            module=fake_anthropic(chunks=(), stop_reason="refusal")))
+ok("a refusal still closes the stream",
+   [e["type"] for e in refused][-1] == "done")
+ok("and says so rather than going silent",
+   "can't answer" in "".join(e["text"] for e in refused if e["type"] == "token"))
+
+# ── the API failing ──────────────────────────────────────────────────────
+boom = RuntimeError("upstream exploded at 0x7f having read " + PROBE)
+failed = frames(cloud_chat({"messages": [{"role": "user", "content": "x"}]},
+                           module=fake_anthropic(fail=boom)))
+kinds = [event["type"] for event in failed]
+
+ok("an API failure is reported", "error" in kinds, kinds)
+ok("the stream still closes cleanly", kinds[-1] == "done", kinds[-1:])
+message = "".join(str(e.get("message", "")) for e in failed if e["type"] == "error")
+ok("the failure reaches the user as a message", bool(message))
+ok("the key is scrubbed from it", PROBE not in message)
+ok("and is visibly redacted", "<redacted>" in message)
+ok("no traceback is exposed",
+   "Traceback" not in message and "File \"" not in message and ".py\"" not in message)
+ok("nothing in the whole response carries the key",
+   PROBE not in json.dumps(failed, default=str))
+
+# ── the SDK missing from the build ───────────────────────────────────────
+absent = frames(cloud_chat({"messages": [{"role": "user", "content": "x"}]},
+                           module=fake_anthropic(
+                               construct_error=RuntimeError("no client for " + PROBE))))
+ok("a broken provider does not crash the deployment",
+   [e["type"] for e in absent][-1] == "done")
+ok("and does not leak the key either",
+   PROBE not in json.dumps(absent, default=str))
+
+# ── malformed requests are still refused with a key present ──────────────
+CAPTURED.clear()  # so the assertion below is about these calls, not earlier ones
+for body, label in (({"messages": []}, "no messages"),
+                    ({"messages": [{"role": "assistant", "content": "hi"}]},
+                     "a trailing assistant turn"),
+                    ({"messages": [{"role": "user", "content": "  "}]}, "blank content"),
+                    ({}, "an empty object"),
+                    ([1, 2], "a non-object body")):
+    ok(label + " is refused with a 400",
+       cloud_chat(body).status_code == 400)
+
+ok("a refused request never reaches the provider", CAPTURED == {})
+
+# ── health reflects the configured state ─────────────────────────────────
+os.environ["ANTHROPIC_API_KEY"] = PROBE
+os.environ["ANTHROPIC_MODEL"] = "claude-haiku-4-5"
+configured = load_cloud()._health()
+ok("health reports online once configured", configured["online"] is True)
+ok("health names the configured model", configured["model"] == "claude-haiku-4-5",
+   configured["model"])
+ok("health still offers no tools", configured["tool_count"] == 0)
+ok("health never carries the key", PROBE not in json.dumps(configured))
+os.environ.pop("ANTHROPIC_API_KEY", None)
+os.environ.pop("ANTHROPIC_MODEL", None)
+
+# ── the key is nowhere in the tree ───────────────────────────────────────
+print("--- the key exists only in the environment ---")
+
+ok("the source never assigns a key literal",
+   re.search(r'ANTHROPIC_API_KEY\s*=\s*["\'][^"\']+["\']', read(CLOUD_API)) is None)
+ok("the source only ever reads it from the environment",
+   read(CLOUD_API).count("ANTHROPIC_API_KEY") ==
+   read(CLOUD_API).count('environ.get("ANTHROPIC_API_KEY"') +
+   read(CLOUD_API).count("ANTHROPIC_API_KEY in ") +
+   read(CLOUD_API).count("set ANTHROPIC_API_KEY in "))
+ok("no interface file mentions the key",
+   not any("ANTHROPIC" in read(os.path.join(WEB, name))
+           for name in ("app.js", "index.html", "style.css", "humanoid.js")))
+ok(".env.example names it without a value",
+   re.search(r"^ANTHROPIC_API_KEY=\s*$", read(os.path.join(ROOT, ".env.example")), re.M))
+ok(".env.example names the model variable without a value",
+   re.search(r"^ANTHROPIC_MODEL=\s*$", read(os.path.join(ROOT, ".env.example")), re.M))
 
 print("\n%d passed, %d failed" % (P, F))
 sys.exit(1 if F else 0)

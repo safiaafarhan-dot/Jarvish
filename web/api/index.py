@@ -51,7 +51,14 @@ WEB_DIR = Path(__file__).resolve().parent.parent
 # anywhere in this file.
 # --------------------------------------------------------------------------
 
-CLOUD_MODEL = os.environ.get("JARVISH_CLOUD_MODEL", "").strip() or "claude-opus-5"
+# ANTHROPIC_MODEL is the name to set in Vercel; JARVISH_CLOUD_MODEL is still
+# read so an existing deployment configured under the older name keeps working.
+# Verified against the SDK's own model list rather than assumed: anthropic
+# 1.5.0 recognises claude-opus-5. Set ANTHROPIC_MODEL=claude-haiku-4-5 for a
+# cheaper public demo — it is a configuration change, not a code change.
+CLOUD_MODEL = (os.environ.get("ANTHROPIC_MODEL", "").strip()
+               or os.environ.get("JARVISH_CLOUD_MODEL", "").strip()
+               or "claude-opus-5")
 
 # Jarvish replies are read aloud by the browser's speech synthesis, so they are
 # meant to be short. A ceiling in the low thousands is the shape of the product
@@ -245,7 +252,18 @@ async def _claude_stream(history, session_id):
 
     # The key is read from the environment by the SDK. It is never accepted
     # from a request and never appears in a response.
-    client = AsyncAnthropic()
+    #
+    # Constructing the client is inside the guard because it can raise on its
+    # own - a malformed key is rejected here, before any request is made. Left
+    # outside, that exception escapes mid-stream, and the client gets a broken
+    # connection while the platform logs a traceback carrying the key.
+    try:
+        client = AsyncAnthropic()
+    except Exception as exc:
+        yield sse({"type": "error",
+                   "message": "The cloud model could not be reached: " + _safe(exc)})
+        yield sse({"type": "done"})
+        return
 
     yield sse({"type": "model", "model": CLOUD_MODEL, "degraded": True,
                "reason": "cloud model - no desktop tools in this deployment"})
