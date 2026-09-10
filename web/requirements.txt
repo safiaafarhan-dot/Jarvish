@@ -1,0 +1,15 @@
+# Dependencies of the Vercel serverless API layer in api/index.py — and of
+# nothing else. The desktop assistant's own dependencies are in the repository
+# root requirements.txt and are deliberately absent here: uiautomation, winsdk,
+# comtypes and sounddevice are Windows-only and would fail the Linux build,
+# and faster-whisper, psutil, pypdf and the MCP client have nothing to do on a
+# host with no desktop, no microphone and no local disk.
+#
+# The deploy root is web/, so this is the file Vercel installs.
+
+fastapi>=0.110
+
+# The optional cloud model provider. Installed unconditionally because the
+# build must be deterministic, but only imported when ANTHROPIC_API_KEY is set
+# — with no key the deployment never constructs a client and never calls out.
+anthropic>=1.4,<2

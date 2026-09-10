@@ -40,12 +40,16 @@ Speech API, which Firefox does not implement.
 | `python new.py --test` | Run every test suite and summarise |
 | `python new.py --autonomy N` | Set the autonomy ceiling (0-5) and exit |
 
-`--test` runs all six suites in one command and skips the live one if no server is
+`--test` runs every suite in one command and skips the live one if no server is
 up. The suites can still be run individually: `python tests/regression.py` for the
 full sweep (needs a running server), `python tests/proactive.py` for the monitor and
 task engine, `python tests/devmode.py` for developer mode, `python tests/plugins.py`
-for the capability registry, `python tests/missions.py` for orchestration, and
-`python tests/cognition.py` for the cognitive layer.
+for the capability registry, `python tests/missions.py` for orchestration,
+`python tests/cognition.py` for the cognitive layer, `python tests/security.py` and
+`python tests/actions.py` for the boundaries between the model and the OS,
+`python tests/deploy.py` for the Vercel deployment boundary,
+`python tests/agent.py` for the agent loop, `python tests/mcp.py` for MCP servers,
+and `python tests/voice.py` for the voice pipeline.
 
 `--backup` writes to `%LOCALAPPDATA%\Jarvish\backups`, deliberately outside the
 project folder and outside OneDrive — a snapshot stored beside the thing it protects
@@ -165,6 +169,14 @@ choose. Decline it and the model is told so, and moves on.
 
 The gate is not just a UI convention — it lives in the agent loop, so
 `POST /api/tool/{name}` refuses gated tools too unless you pass `"confirm": true`.
+
+**The `low` tier never asks, so its reach is fixed in advance.** `open_app` launches only
+what is in `APP_ALIASES` — an unlisted name is refused rather than passed to the shell,
+which also refuses anything carrying arguments, since `start` treats its argument as a
+command line and not a filename. `open_url` opens `http` and `https` only: `file:` would
+read the same credential paths the filesystem guard blocks, and `javascript:` and `data:`
+execute in whatever page is focused. `open_settings` and `open_web_app` work from their
+own catalogues the same way. `tests/actions.py` holds these boundaries in place.
 
 Above the gate sits the **autonomy ceiling**, which decides how much Jarvish may do
 without asking at all. It can only ever make Jarvish more cautious — see
@@ -887,6 +899,98 @@ python new.py
 It is disabled deliberately, and it is graded **critical**, so even with
 `JARVISH_ALLOW_SHELL=1` every call stops and shows you the command before it runs.
 Enabling it means a language model can run anything on your machine with your privileges.
+
+---
+
+## Deploying the interface
+
+Jarvish is a desktop assistant. **The interface deploys; the assistant does not.**
+
+```
+LOCAL        browser -> web/ -> jarvish/server.py -> Ollama + 122 desktop tools
+PRODUCTION   browser -> web/ on Vercel -> web/api/index.py -> optional cloud model
+```
+
+The local build is unchanged and stays the real one. Ollama runs on your machine and
+is not reachable from Vercel, and nothing in this repository tries to expose it — a
+serverless function's `127.0.0.1` is the function itself, not your PC.
+
+### The one setting that matters
+
+**Root Directory must be `web`** in the Vercel project settings.
+
+This is not cosmetic. With the repository root as the root directory, Vercel finds the
+root `package.json`, runs `npm install`, and that triggers its `postinstall` hook:
+
+```
+"postinstall": "python -m pip install -r requirements.txt"
+```
+
+That file is the *desktop* dependency list. It contains `winsdk`, which publishes
+Windows-only wheels and a source distribution that needs the Windows SDK to build.
+On Vercel's Linux builder there is no wheel to install and no SDK to build with, so
+the install fails and the deployment goes red before a single file is served.
+
+Setting Root Directory to `web` removes the problem by construction: the root
+`package.json` and the desktop `requirements.txt` are outside the build entirely, and
+the only dependency file Vercel sees is `web/requirements.txt` — FastAPI and the
+optional model provider, both of which install cleanly on Linux.
+
+The root `vercel.json` exists only as a guard for a project that is still pointed at
+the repository root: it overrides the install and build commands so the Windows-only
+install can never run, and pins the output to `web/` so the deployment cannot publish
+`jarvish/`, `tests/` or `new.py` as static files. A build in that state serves the
+interface with no API behind it. Fix the Root Directory rather than rely on it.
+
+### What the deployment can and cannot do
+
+| | Deployed | Why |
+|---|---|---|
+| The HUD, its styling and its animation | yes | plain static files, no build step |
+| `GET /api/health` | yes | reports what the deployment actually is |
+| `POST /api/chat` | only with a key | needs an external model; see below |
+| Ollama, model routing | **no** | the model runs on your machine |
+| The 122 desktop tools, `run_powershell` | **no** | they act on your PC |
+| Voice, wake word, speech-to-text | **no** | the microphone belongs to the desktop process |
+| Screen vision, window control | **no** | needs a real desktop session |
+| Browser driving over CDP | **no** | needs a browser on your machine |
+| Tasks, missions, proactive monitor | **no** | long-lived threads with local databases |
+| MCP servers | **no** | subprocesses on your machine |
+| Knowledge index, personal memory | **no** | SQLite and files on local disk |
+
+Everything in the "no" rows returns `503` with the reason. The HUD already draws a
+failed subsystem call as offline, so it degrades on its own — no interface file was
+changed to make the deployment work.
+
+### The optional cloud model
+
+`POST /api/chat` answers only if `ANTHROPIC_API_KEY` is set on the Vercel project.
+Without it the deployment still builds, still serves and still replies — it says it
+has no model rather than crashing or pretending. The key is read from the environment,
+never accepted from a request, and scrubbed out of any error text before it is
+returned. It is never used by the local build.
+
+| Variable | Required | What it does |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | no | enables cloud replies. Without it, chat says so |
+| `JARVISH_CLOUD_MODEL` | no | overrides the default model id |
+| `JARVISH_CLOUD_MAX_TOKENS` | no | reply ceiling, default 8192 |
+| `JARVISH_ALLOWED_ORIGINS` | no | comma-separated CORS allowlist. Empty is correct: the interface and the API share one origin, so no CORS header is sent and no wildcard exists |
+
+`.env.example` lists every variable by name and holds no values. `.env` is git-ignored.
+
+### Deploying
+
+1. Vercel project → Settings → General → **Root Directory: `web`** → Save.
+2. Settings → Environment Variables → add `ANTHROPIC_API_KEY` for Production if you
+   want cloud replies. Skip it and the deployment is still valid.
+3. Push. The build runs no install for the interface and installs
+   `web/requirements.txt` for the one function.
+
+`python tests/deploy.py` holds this boundary in place: that local-only endpoints keep
+refusing, that a missing key degrades instead of crashing, that no credential can
+reach a response, and that the deployment config never grows a path back to
+`127.0.0.1`.
 
 ---
 

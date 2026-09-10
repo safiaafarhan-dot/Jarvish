@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -650,8 +650,22 @@ async def _stop_background():
 NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
 
 
+# web/ is the HUD, but it is also the folder Vercel deploys, so it holds two
+# files that belong to that build and not to this one: the serverless API layer
+# and its Linux dependency list. Serving them here would publish their source at
+# /static/api/index.py to anything that can reach this server — which is the LAN
+# whenever Jarvish is started with `--host 0.0.0.0`. Neither file contains a
+# secret, and this is what keeps that true rather than a matter of luck.
+NOT_SERVED = ("api/", "requirements.txt")
+
+
 class RevalidatedStatic(StaticFiles):
-    """Static files that must be revalidated before reuse."""
+    """Static files that must be revalidated before reuse, minus the cloud build."""
+
+    async def get_response(self, path, scope):
+        if path.replace("\\", "/").lstrip("/").startswith(NOT_SERVED):
+            raise HTTPException(status_code=404)
+        return await super().get_response(path, scope)
 
     def file_response(self, *args, **kwargs):
         response = super().file_response(*args, **kwargs)

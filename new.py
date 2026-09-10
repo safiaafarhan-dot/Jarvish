@@ -925,7 +925,7 @@ def _models():
 def _tests():
     """Run the suites and summarise. The live one needs a server; say so."""
     suites = ["cognition", "missions", "plugins", "devmode", "proactive",
-              "voice", "security", "agent", "mcp", "regression"]
+              "voice", "security", "actions", "deploy", "agent", "mcp", "regression"]
     live = _port_in_use("127.0.0.1", 8000)
 
     print("Running the test suites\n" + "-" * 52)

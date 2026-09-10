@@ -16,3 +16,8 @@
 *.key
 *.db
 *.log
+
+# Python bytecode from the serverless layer. Generated, never source, and
+# uploading it can shadow a newer .py on a case-insensitive checkout.
+__pycache__/
+*.pyc
