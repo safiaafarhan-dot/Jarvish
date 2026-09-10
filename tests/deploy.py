@@ -173,6 +173,50 @@ for entry, base in ((root_entry, ROOT), (web_entry, WEB)):
 ok("the entrypoint is not the desktop backend",
    "jarvish" not in root_entry and "jarvish" not in web_entry)
 
+# Vercel's Python build runs `uv lock`, and uv requires a PEP 621 [project]
+# table. Declaring only [tool.vercel] failed the build with "No project table
+# found in: .../web/pyproject.toml", so the deploy root's pyproject must carry
+# one. Parsed by regex rather than tomllib, which is 3.11+ only.
+print("--- the deploy root is a project uv can resolve ---")
+
+web_toml = read(os.path.join(WEB, "pyproject.toml"))
+
+ok("[project] is declared", "[project]" in web_toml)
+for field in ("name", "version", "requires-python", "dependencies"):
+    ok("[project] carries " + field,
+       re.search(r"^" + re.escape(field) + r"\s*=", web_toml, re.M) is not None)
+
+floor = re.search(r'requires-python\s*=\s*"([^"]+)"', web_toml)
+ok("requires-python is declared", floor is not None, floor and floor.group(1))
+# fastapi and anthropic both floor at 3.10; anything lower cannot resolve.
+ok("and is at least 3.10", floor and floor.group(1).strip() in (">=3.10", ">=3.11", ">=3.12"),
+   floor and floor.group(1))
+
+ok("uv is told this is not a package to build",
+   "[tool.uv]" in web_toml and re.search(r"package\s*=\s*false", web_toml) is not None)
+
+# The two dependency lists must say the same thing: requirements.txt is what a
+# repository-root build installs, pyproject is what uv resolves at the deploy
+# root. They cannot be allowed to drift.
+def normalise(spec):
+    return spec.strip().strip(",").strip().strip('"').strip().replace(" ", "")
+
+block = re.search(r"dependencies\s*=\s*\[(.*?)\]", web_toml, re.S)
+ok("the dependency list parses", block is not None)
+declared = sorted(normalise(line) for line in block.group(1).splitlines() if normalise(line))
+listed = sorted(normalise(line) for line in
+                read(os.path.join(WEB, "requirements.txt")).splitlines()
+                if line.strip() and not line.strip().startswith("#"))
+
+ok("pyproject and requirements.txt agree exactly", declared == listed,
+   str(declared) + " vs " + str(listed))
+ok("it declares only what the function needs", len(declared) == 2, declared)
+
+for windows_only in ("winsdk", "uiautomation", "comtypes", "sounddevice",
+                     "faster-whisper", "psutil", "pypdf", "uvicorn", "mcp"):
+    ok("[project] never pulls in " + windows_only,
+       not any(dep.startswith(windows_only) for dep in declared))
+
 # `functions` is keyed by the resolved entrypoint path, not by a URL.
 root_config = json.loads(read(os.path.join(ROOT, "vercel.json")))
 config = json.loads(read(os.path.join(WEB, "vercel.json")))

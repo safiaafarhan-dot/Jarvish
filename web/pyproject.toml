@@ -1,11 +1,40 @@
-# The same Vercel entrypoint setting as the repository root's pyproject.toml,
-# written from this directory — for a project whose Root Directory is `web`.
-# Vercel reads whichever pyproject.toml sits at the directory it builds from,
-# so the deployment resolves an entrypoint either way and the web/ boundary is
-# preserved when the Root Directory is set to it.
+# The deployed interface, as a Python project — because Vercel's Python build
+# runs `uv lock`, and uv requires a PEP 621 `[project]` table. Declaring only
+# `[tool.vercel]` here was what failed:
 #
-# From here the module path drops the leading `web.`: this resolves to
-# ./api/index.py, the same file the root config reaches as web/api/index.py.
+#   error: No project table found in: /vercel/path0/web/pyproject.toml
+#
+# This describes the deployment and nothing else. The desktop assistant is a
+# separate thing entirely: it lives above this directory, is started with
+# `python new.py`, and installs its own requirements.txt — the Windows-only
+# one, with uiautomation, winsdk and comtypes in it. None of that is named
+# here and none of it can reach a Linux builder from here.
+
+[project]
+name = "jarvish-web"
+version = "2.0.0"
+description = "The Jarvish interface, and the small API that serves it on Vercel."
+# Both dependencies below floor at 3.10, so anything lower cannot resolve.
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "anthropic>=1.4,<2",
+]
+
+# Deliberately the same two lines as requirements.txt, which is still what a
+# repository-root build installs. tests/deploy.py asserts the two lists agree,
+# so they cannot drift apart unnoticed.
+
+[tool.uv]
+# Nothing here is built or installed as a package — this is an application
+# that uv only resolves dependencies for. Without this, uv would look for a
+# build backend that does not exist and has no reason to.
+package = false
 
 [tool.vercel]
+# Vercel's supported entrypoints are app.py, index.py, server.py, main.py,
+# wsgi.py and asgi.py, optionally under src/ or app/. `api/index.py` is not
+# one of them, so it has to be named. From this directory the module path is
+# api.index; the repository root's pyproject.toml reaches the same file as
+# web.api.index, for a build rooted there instead.
 entrypoint = "api.index:app"
